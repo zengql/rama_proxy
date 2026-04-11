@@ -12,7 +12,7 @@ use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::ServerConfigFile,
@@ -36,7 +36,7 @@ pub async fn run(config: ServerConfigFile) -> Result<(), AppError> {
     );
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = accept_with_retry(&listener).await?;
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, peer, config).await {
@@ -54,6 +54,33 @@ async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, AppError> {
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     Ok(socket.listen(4096)?)
+}
+
+async fn accept_with_retry(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), AppError> {
+    loop {
+        match listener.accept().await {
+            Ok(conn) => return Ok(conn),
+            Err(err) if is_retryable_accept_error(&err) => {
+                warn!(
+                    error = %err,
+                    raw_os_error = err.raw_os_error(),
+                    "accept failed; backing off before retry"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(AppError::Io(err)),
+        }
+    }
+}
+
+fn is_retryable_accept_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    ) || matches!(err.raw_os_error(), Some(24) | Some(10024))
 }
 
 async fn handle_connection(
