@@ -7,6 +7,7 @@ The current target is:
 - `client` runs locally and exposes SOCKS5 TCP/UDP to Clash
 - `server` runs remotely and performs outbound access
 - client-to-server traffic uses pre-established TCP tunnels instead of direct per-request SOCKS5 from Clash to the remote host
+- optional Rama rustls-based TLS can be enabled for the client-to-server tunnel
 
 ## Scope
 
@@ -68,6 +69,13 @@ workers = 0
 [auth]
 shared_secret = "change-me"
 
+[tls]
+enabled = false
+cert_path = ""
+key_path = ""
+require_client_auth = false
+client_ca_cert_path = ""
+
 [log]
 level = "info"
 format = "text"
@@ -79,6 +87,8 @@ Notes:
 - `server.port` is the tunnel port used by clients
 - `outbound_ip_mode` controls how the remote server connects to target addresses
 - `auth.shared_secret` must match the client config
+- enable `[tls]` to protect the tunnel with server certificate based TLS
+- `tls.require_client_auth = true` enables mTLS-style client certificate verification
 
 ## Client Config
 
@@ -103,6 +113,14 @@ idle_timeout_secs = 60
 mode = "none"
 users = []
 
+[tls]
+enabled = false
+server_name = ""
+ca_cert_path = ""
+insecure_skip_verify = false
+client_cert_path = ""
+client_key_path = ""
+
 [log]
 level = "info"
 format = "text"
@@ -115,6 +133,9 @@ Notes:
 - `socks5.bind` and `socks5.port` define the local endpoint for Clash Party
 - `udp.enabled` enables local SOCKS5 `UDP ASSOCIATE`
 - `auth` controls local SOCKS5 authentication between Clash Party and the local client
+- `tls.server_name` and `tls.ca_cert_path` are required when `tls.enabled = true`
+- `tls.client_cert_path` and `tls.client_key_path` are optional and used only when the server requires client auth
+- `tls.insecure_skip_verify` is reserved and currently rejected by config validation
 
 ## Clash Party
 
@@ -148,8 +169,9 @@ proxies:
 2. Start `rama-proxy server`.
 3. Initialize and edit `config/client.toml` on the local host.
 4. Set `client.server_addr` and `auth.shared_secret`.
-5. Start `rama-proxy client`.
-6. Point Clash Party to the local SOCKS5 endpoint.
+5. If needed, enable and configure `[tls]` on both sides.
+6. Start `rama-proxy client`.
+7. Point Clash Party to the local SOCKS5 endpoint.
 
 ## Current Behavior
 
@@ -158,6 +180,7 @@ This version is focused on a stable first cut:
 - TCP requests use a tunnel connection that is opened by the local client and switched into raw relay mode after the server confirms the target
 - UDP associate uses one tunnel TCP control connection plus one local UDP socket per SOCKS5 association
 - the client maintains a pool of pre-authenticated idle tunnel connections
+- when TLS is enabled, the tunnel transport is wrapped by Rama rustls before the private tunnel handshake starts
 
 This is not a full multi-stream multiplexing transport yet. It is intentionally simpler so the TCP/UDP proxy path stays easier to reason about and debug.
 

@@ -14,6 +14,8 @@ pub struct ServerConfigFile {
     #[serde(default)]
     pub auth: TunnelAuthConfig,
     #[serde(default)]
+    pub tls: ServerTlsConfig,
+    #[serde(default)]
     pub log: LogConfig,
 }
 
@@ -46,7 +48,39 @@ pub struct ClientConfigFile {
     #[serde(default)]
     pub auth: LocalAuthConfig,
     #[serde(default)]
+    pub tls: ClientTlsConfig,
+    #[serde(default)]
     pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: String,
+    #[serde(default)]
+    pub key_path: String,
+    #[serde(default)]
+    pub require_client_auth: bool,
+    #[serde(default)]
+    pub client_ca_cert_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub ca_cert_path: String,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default)]
+    pub client_cert_path: String,
+    #[serde(default)]
+    pub client_key_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +138,7 @@ impl Default for ServerConfigFile {
         Self {
             server: TunnelServerConfig::default(),
             auth: TunnelAuthConfig::default(),
+            tls: ServerTlsConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -135,7 +170,33 @@ impl Default for ClientConfigFile {
             socks5: LocalSocks5Config::default(),
             udp: LocalUdpConfig::default(),
             auth: LocalAuthConfig::default(),
+            tls: ClientTlsConfig::default(),
             log: LogConfig::default(),
+        }
+    }
+}
+
+impl Default for ServerTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: String::new(),
+            key_path: String::new(),
+            require_client_auth: false,
+            client_ca_cert_path: String::new(),
+        }
+    }
+}
+
+impl Default for ClientTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: String::new(),
+            ca_cert_path: String::new(),
+            insecure_skip_verify: false,
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
         }
     }
 }
@@ -205,6 +266,7 @@ impl ServerConfigFile {
                 "auth.shared_secret must not be empty".to_string(),
             ));
         }
+        validate_server_tls_config(&self.tls)?;
         Ok(())
     }
 }
@@ -245,6 +307,7 @@ impl ClientConfigFile {
                 "auth.users must not be empty when auth.mode is 'password'".to_string(),
             ));
         }
+        validate_client_tls_config(&self.tls)?;
         Ok(())
     }
 }
@@ -264,6 +327,80 @@ fn validate_outbound_ip_mode(mode: &str) -> Result<(), AppError> {
                 .to_string(),
         )),
     }
+}
+
+fn validate_server_tls_config(tls: &ServerTlsConfig) -> Result<(), AppError> {
+    if !tls.enabled {
+        return Ok(());
+    }
+
+    require_non_empty_file(&tls.cert_path, "tls.cert_path")?;
+    require_non_empty_file(&tls.key_path, "tls.key_path")?;
+
+    if tls.require_client_auth {
+        require_non_empty_file(&tls.client_ca_cert_path, "tls.client_ca_cert_path")?;
+    } else if !tls.client_ca_cert_path.trim().is_empty() {
+        require_existing_file(&tls.client_ca_cert_path, "tls.client_ca_cert_path")?;
+    }
+
+    Ok(())
+}
+
+fn validate_client_tls_config(tls: &ClientTlsConfig) -> Result<(), AppError> {
+    if !tls.enabled {
+        return Ok(());
+    }
+
+    if tls.server_name.trim().is_empty() {
+        return Err(AppError::InvalidConfig(
+            "tls.server_name must not be empty when tls.enabled is true".to_string(),
+        ));
+    }
+
+    if tls.insecure_skip_verify {
+        return Err(AppError::InvalidConfig(
+            "tls.insecure_skip_verify is reserved and not supported yet".to_string(),
+        ));
+    }
+    require_non_empty_file(&tls.ca_cert_path, "tls.ca_cert_path")?;
+
+    let has_client_cert = !tls.client_cert_path.trim().is_empty();
+    let has_client_key = !tls.client_key_path.trim().is_empty();
+    match (has_client_cert, has_client_key) {
+        (true, true) => {
+            require_existing_file(&tls.client_cert_path, "tls.client_cert_path")?;
+            require_existing_file(&tls.client_key_path, "tls.client_key_path")?;
+        }
+        (false, false) => {}
+        _ => {
+            return Err(AppError::InvalidConfig(
+                "tls.client_cert_path and tls.client_key_path must be configured together"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn require_non_empty_file(value: &str, field: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() {
+        return Err(AppError::InvalidConfig(format!(
+            "{field} must not be empty when tls is enabled"
+        )));
+    }
+    require_existing_file(value, field)
+}
+
+fn require_existing_file(value: &str, field: &str) -> Result<(), AppError> {
+    let path = Path::new(value);
+    if !path.is_file() {
+        return Err(AppError::InvalidConfig(format!(
+            "{field} must point to an existing file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn write_default_template(path: &Path, force: bool, content: String) -> Result<(), AppError> {
@@ -341,6 +478,13 @@ workers = 0
 [auth]
 shared_secret = "change-me"
 
+[tls]
+enabled = false
+cert_path = ""
+key_path = ""
+require_client_auth = false
+client_ca_cert_path = ""
+
 [log]
 level = "info"
 format = "text"
@@ -368,6 +512,14 @@ idle_timeout_secs = 60
 [auth]
 mode = "none"
 users = []
+
+[tls]
+enabled = false
+server_name = ""
+ca_cert_path = ""
+insecure_skip_verify = false
+client_cert_path = ""
+client_key_path = ""
 
 [log]
 level = "info"

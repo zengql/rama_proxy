@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod logging;
 mod server_runtime;
+mod tls;
 mod tunnel;
 
 use std::path::Path;
@@ -46,8 +47,8 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
             let config = ServerConfigFile::from_path(&path)?;
             config.validate()?;
             println!(
-                "server config valid: bind={}:{}, outbound_ip_mode={}",
-                config.server.bind, config.server.port, config.server.outbound_ip_mode
+                "server config valid: bind={}:{}, outbound_ip_mode={}, tls={}",
+                config.server.bind, config.server.port, config.server.outbound_ip_mode, config.tls.enabled
             );
             Ok(())
         }
@@ -76,11 +77,12 @@ async fn handle_client(cmd: ClientCommand) -> Result<(), AppError> {
             let config = ClientConfigFile::from_path(&path)?;
             config.validate()?;
             println!(
-                "client config valid: local_socks5={}:{}, server_addr={}, udp={}",
+                "client config valid: local_socks5={}:{}, server_addr={}, udp={}, tls={}",
                 config.socks5.bind,
                 config.socks5.port,
                 config.client.server_addr,
-                config.udp.enabled
+                config.udp.enabled,
+                config.tls.enabled
             );
             Ok(())
         }

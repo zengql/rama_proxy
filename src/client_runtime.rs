@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{ClientConfigFile, UserConfig},
     error::AppError,
+    tls::build_client_tls_context,
     tunnel::{
         TunnelPool, opcode_is_close, opcode_is_pong, opcode_is_udp_packet, read_opcode,
         read_response, read_udp_packet, write_close, write_open_connect, write_open_udp,
@@ -34,8 +35,9 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
     let bind_ip = parse_bind_ip(&config.socks5.bind)?;
     let listen_addr = SocketAddr::new(bind_ip, config.socks5.port);
     let listener = bind_listener(listen_addr).await?;
+    let tls = build_client_tls_context(&config.tls)?;
 
-    let pool = TunnelPool::new(&config.client)?;
+    let pool = TunnelPool::new(&config.client, tls)?;
     pool.spawn_maintainer();
 
     info!(
@@ -43,6 +45,7 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
         server_addr = %config.client.server_addr,
         udp_enabled = config.udp.enabled,
         pool_size = config.client.pool_size,
+        tls_enabled = config.tls.enabled,
         "client socks5 listener started"
     );
 

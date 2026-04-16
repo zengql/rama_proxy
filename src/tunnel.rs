@@ -11,7 +11,10 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
-use crate::config::TunnelClientConfig;
+use crate::{
+    config::TunnelClientConfig,
+    tls::ClientTlsContext,
+};
 use crate::error::AppError;
 
 const MAGIC: &[u8; 4] = b"RPT1";
@@ -31,19 +34,29 @@ const STATUS_BAD_REQUEST: u8 = 0x02;
 const STATUS_CONNECT_FAILED: u8 = 0x03;
 const STATUS_RESOLVE_FAILED: u8 = 0x04;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TunnelPool {
     server_addr: SocketAddr,
     shared_secret: Arc<str>,
     connect_timeout: Duration,
-    idle_tx: mpsc::Sender<TcpStream>,
-    idle_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    idle_tx: mpsc::Sender<TunnelStream>,
+    idle_rx: Arc<Mutex<mpsc::Receiver<TunnelStream>>>,
     desired_size: usize,
     connecting: Arc<AtomicUsize>,
+    tls: Option<ClientTlsContext>,
 }
 
+pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub type TunnelStream = Box<dyn TunnelIo>;
+
 impl TunnelPool {
-    pub fn new(config: &TunnelClientConfig) -> Result<Self, AppError> {
+    pub fn new(
+        config: &TunnelClientConfig,
+        tls: Option<ClientTlsContext>,
+    ) -> Result<Self, AppError> {
         let server_addr = config
             .server_addr
             .parse::<SocketAddr>()
@@ -57,6 +70,7 @@ impl TunnelPool {
             idle_rx: Arc::new(Mutex::new(idle_rx)),
             desired_size: config.pool_size,
             connecting: Arc::new(AtomicUsize::new(0)),
+            tls,
         })
     }
 
@@ -88,9 +102,10 @@ impl TunnelPool {
         let shared_secret = self.shared_secret.clone();
         let connect_timeout = self.connect_timeout;
         let connecting = self.connecting.clone();
+        let tls = self.tls.clone();
         connecting.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            let result = connect_idle_tunnel(server_addr, &shared_secret, connect_timeout).await;
+            let result = connect_idle_tunnel(server_addr, &shared_secret, connect_timeout, tls).await;
             connecting.fetch_sub(1, Ordering::SeqCst);
             match result {
                 Ok(stream) => {
@@ -105,11 +120,17 @@ impl TunnelPool {
         });
     }
 
-    pub async fn acquire(&self) -> Result<TcpStream, AppError> {
+    pub async fn acquire(&self) -> Result<TunnelStream, AppError> {
         if let Some(stream) = self.idle_rx.lock().await.recv().await {
             return Ok(stream);
         }
-        connect_idle_tunnel(self.server_addr, &self.shared_secret, self.connect_timeout).await
+        connect_idle_tunnel(
+            self.server_addr,
+            &self.shared_secret,
+            self.connect_timeout,
+            self.tls.clone(),
+        )
+        .await
     }
 }
 
@@ -117,16 +138,29 @@ async fn connect_idle_tunnel(
     server_addr: SocketAddr,
     shared_secret: &str,
     connect_timeout: Duration,
-) -> Result<TcpStream, AppError> {
-    let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(server_addr))
+    tls: Option<ClientTlsContext>,
+) -> Result<TunnelStream, AppError> {
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(server_addr))
         .await
         .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))??;
     stream.set_nodelay(true)?;
+    let mut stream: TunnelStream = match tls {
+        Some(tls) => Box::new(
+            tls.connector
+                .connect(tls.server_name, stream)
+                .await
+                .map_err(|err| AppError::Boxed(format!("tls connect failed: {err}")))?,
+        ),
+        None => Box::new(stream),
+    };
     client_handshake(&mut stream, shared_secret).await?;
     Ok(stream)
 }
 
-pub async fn client_handshake(stream: &mut TcpStream, shared_secret: &str) -> Result<(), AppError> {
+pub async fn client_handshake<S>(stream: &mut S, shared_secret: &str) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     stream.write_all(MAGIC).await?;
     stream.write_u8(VERSION).await?;
     write_string(stream, shared_secret).await?;
@@ -144,7 +178,10 @@ pub async fn client_handshake(stream: &mut TcpStream, shared_secret: &str) -> Re
     }
 }
 
-pub async fn server_handshake(stream: &mut TcpStream, shared_secret: &str) -> Result<(), AppError> {
+pub async fn server_handshake<S>(stream: &mut S, shared_secret: &str) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic).await?;
     if &magic != MAGIC {
