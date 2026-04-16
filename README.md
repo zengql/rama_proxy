@@ -137,6 +137,175 @@ Notes:
 - `tls.client_cert_path` and `tls.client_key_path` are optional and used only when the server requires client auth
 - `tls.insecure_skip_verify` is reserved and currently rejected by config validation
 
+## TLS Overview
+
+TLS in `rama-proxy` applies only to the `client <-> server` tunnel.
+
+It does not change:
+
+- the local SOCKS5 endpoint exposed by `client`
+- the private tunnel opcode semantics
+- the shared-secret check after the TLS handshake
+
+Current TLS behavior:
+
+- `server.tls.enabled = true` means all connecting clients must use TLS
+- `server.tls.enabled = false` means all connecting clients must use plaintext
+- mixed TLS and non-TLS clients are not supported on the same listener
+- mTLS is optional and enabled only when `server.tls.require_client_auth = true`
+
+## TLS Certificate Generation
+
+The examples below use `openssl`.
+
+### 1. Generate a CA
+
+```powershell
+openssl genrsa -out ca.key 2048
+openssl req -x509 -new -key ca.key -sha256 -days 3650 -out ca.crt -subj "/CN=rama-proxy-ca"
+```
+
+### 2. Generate the server certificate
+
+Use a CN / SAN value that the client will use as `tls.server_name`.
+
+Create `server.ext`:
+
+```text
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = rama-proxy-server
+IP.1 = 127.0.0.1
+```
+
+Generate and sign the server certificate:
+
+```powershell
+openssl genrsa -out server.key 2048
+openssl req -new -key server.key -out server.csr -subj "/CN=rama-proxy-server"
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 3650 -sha256 -extfile server.ext
+```
+
+### 3. Optional: generate a client certificate for mTLS
+
+Create `client.ext`:
+
+```text
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth
+```
+
+Generate and sign the client certificate:
+
+```powershell
+openssl genrsa -out client.key 2048
+openssl req -new -key client.key -out client.csr -subj "/CN=rama-proxy-client"
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 3650 -sha256 -extfile client.ext
+```
+
+Generated files:
+
+- `ca.crt`: CA certificate used by the client to verify the server
+- `server.crt` / `server.key`: server certificate and private key
+- `client.crt` / `client.key`: optional client certificate and private key for mTLS
+
+## TLS Configuration Examples
+
+### 1. One-way TLS
+
+Server:
+
+```toml
+[tls]
+enabled = true
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+require_client_auth = false
+client_ca_cert_path = ""
+```
+
+Client:
+
+```toml
+[tls]
+enabled = true
+server_name = "rama-proxy-server"
+ca_cert_path = "certs/ca.crt"
+insecure_skip_verify = false
+client_cert_path = ""
+client_key_path = ""
+```
+
+Notes:
+
+- `client.tls.server_name` must match the server certificate CN or SAN
+- if the server certificate only contains an IP SAN, use that IP as `server_name`
+- the client must trust the CA that signed `server.crt`
+
+### 2. mTLS
+
+Server:
+
+```toml
+[tls]
+enabled = true
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+require_client_auth = true
+client_ca_cert_path = "certs/ca.crt"
+```
+
+Client:
+
+```toml
+[tls]
+enabled = true
+server_name = "rama-proxy-server"
+ca_cert_path = "certs/ca.crt"
+insecure_skip_verify = false
+client_cert_path = "certs/client.crt"
+client_key_path = "certs/client.key"
+```
+
+Notes:
+
+- when `require_client_auth = true`, the client certificate must be signed by the CA trusted by `client_ca_cert_path`
+- `client_cert_path` and `client_key_path` must be configured together
+
+## TLS Usage
+
+Recommended order:
+
+1. Generate the CA and server certificate.
+2. Copy `server.crt` and `server.key` to the remote server host.
+3. Copy `ca.crt` to the client host.
+4. If mTLS is enabled, also copy `client.crt` and `client.key` to the client host.
+5. Update `[tls]` in both `config/server.toml` and `config/client.toml`.
+6. Run `rama-proxy server check --config config/server.toml`.
+7. Run `rama-proxy client check --config config/client.toml`.
+8. Start the server, then start the client.
+
+Expected result:
+
+- the client connects to the server over TLS first
+- after TLS succeeds, the existing private tunnel handshake still runs
+- SOCKS5 users continue to connect only to the local `client`
+
+Common mistakes:
+
+- `client.tls.server_name` does not match the server certificate
+- `client.tls.ca_cert_path` does not trust the issuing CA
+- enabling TLS on only one side
+- setting `require_client_auth = true` on the server without configuring client certs
+- trying to use `tls.insecure_skip_verify`, which is currently rejected
+
 ## Clash Party
 
 Point Clash Party to the local `client` listener instead of the remote server:
@@ -169,7 +338,7 @@ proxies:
 2. Start `rama-proxy server`.
 3. Initialize and edit `config/client.toml` on the local host.
 4. Set `client.server_addr` and `auth.shared_secret`.
-5. If needed, enable and configure `[tls]` on both sides.
+5. If needed, generate certificates and enable `[tls]` on both sides.
 6. Start `rama-proxy client`.
 7. Point Clash Party to the local SOCKS5 endpoint.
 
