@@ -4,21 +4,15 @@ use std::time::{Duration, Instant};
 
 use rama::{
     bytes::BytesMut,
-    net::{
-        address::HostWithPort,
-        user::credentials::Basic,
-    },
-    proxy::socks5::proto::{
-        Command, ReplyKind, SocksMethod, client, server,
-        udp::UdpHeader,
-    },
+    net::{address::HostWithPort, user::credentials::Basic},
+    proxy::socks5::proto::{Command, ReplyKind, SocksMethod, client, server, udp::UdpHeader},
     utils::str::NonEmptyStr,
 };
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     config::{ClientConfigFile, UserConfig},
@@ -30,6 +24,10 @@ use crate::{
         write_ping, write_udp_packet,
     },
 };
+
+const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
     let bind_ip = parse_bind_ip(&config.socks5.bind)?;
@@ -55,7 +53,7 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
         let pool = pool.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_client(stream, peer, &config, &pool).await {
-                debug!(client = %peer, error = %err, "local socks5 session ended with error");
+                warn!(client = %peer, error = %err, "local socks5 session ended with error");
             }
         });
     }
@@ -78,9 +76,11 @@ async fn handle_client(
     pool: &TunnelPool,
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
+    info!(client = %peer, "accepted local socks5 session");
 
-    let header = client::Header::read_from(&mut stream)
+    let header = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, client::Header::read_from(&mut stream))
         .await
+        .map_err(|_| AppError::Boxed(format!("read socks5 header timed out for {peer}")))?
         .map_err(|err| AppError::Boxed(format!("read socks5 header failed: {err}")))?;
 
     let method = negotiate_method(&header, config)?;
@@ -93,12 +93,16 @@ async fn handle_client(
     }
 
     if method == SocksMethod::UsernamePassword {
-        authorize_user(&mut stream, config).await?;
+        tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, authorize_user(&mut stream, config))
+            .await
+            .map_err(|_| AppError::Boxed(format!("authorize socks5 user timed out for {peer}")))??;
     }
 
-    let request = client::Request::read_from(&mut stream)
+    let request = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, client::Request::read_from(&mut stream))
         .await
+        .map_err(|_| AppError::Boxed(format!("read socks5 request timed out for {peer}")))?
         .map_err(|err| AppError::Boxed(format!("read socks5 request failed: {err}")))?;
+    info!(client = %peer, command = ?request.command, destination = %request.destination, "received socks5 request");
 
     match request.command {
         Command::Connect => serve_connect(stream, peer, request.destination, pool).await,
@@ -123,7 +127,10 @@ async fn handle_client(
     }
 }
 
-fn negotiate_method(header: &client::Header, config: &ClientConfigFile) -> Result<SocksMethod, AppError> {
+fn negotiate_method(
+    header: &client::Header,
+    config: &ClientConfigFile,
+) -> Result<SocksMethod, AppError> {
     let wants_password = config.auth.mode == "password";
     let method = if wants_password {
         if header.methods.contains(&SocksMethod::UsernamePassword) {
@@ -164,7 +171,9 @@ async fn authorize_user(stream: &mut TcpStream, config: &ClientConfigFile) -> Re
         server::UsernamePasswordResponse::new_invalid_credentails()
             .write_to(stream)
             .await?;
-        Err(AppError::InvalidConfig("invalid local socks5 credentials".to_string()))
+        Err(AppError::InvalidConfig(
+            "invalid local socks5 credentials".to_string(),
+        ))
     }
 }
 
@@ -174,14 +183,25 @@ async fn serve_connect(
     destination: HostWithPort,
     pool: &TunnelPool,
 ) -> Result<(), AppError> {
-    let mut tunnel = pool.acquire().await?;
+    let mut tunnel = tokio::time::timeout(TUNNEL_ACQUIRE_TIMEOUT, pool.acquire())
+        .await
+        .map_err(|_| AppError::Boxed(format!(
+            "acquire tunnel timed out for {peer} -> {destination}"
+        )))??;
     write_open_connect(&mut tunnel, &destination).await?;
-    if let Err(err) = read_response(&mut tunnel).await {
+    if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
+        .await
+        .map_err(|_| AppError::Boxed(format!(
+            "wait tunnel open response timed out for {peer} -> {destination}"
+        )))?
+    {
+        warn!(client = %peer, destination = %destination, error = %err, "tunnel open connect failed");
         server::Reply::error_reply(ReplyKind::GeneralServerFailure)
             .write_to(&mut stream)
             .await?;
         return Err(err);
     }
+    info!(client = %peer, destination = %destination, "tcp tunnel connected");
 
     server::Reply::new(HostWithPort::default_ipv4(0))
         .write_to(&mut stream)
@@ -190,7 +210,7 @@ async fn serve_connect(
     let result = copy_bidirectional(&mut stream, &mut tunnel).await;
     match result {
         Ok((up_bytes, down_bytes)) => {
-            debug!(
+            info!(
                 client = %peer,
                 destination = %destination,
                 up_bytes,
@@ -199,7 +219,10 @@ async fn serve_connect(
             );
             Ok(())
         }
-        Err(err) => Err(AppError::Io(err)),
+        Err(err) => {
+            warn!(client = %peer, destination = %destination, error = %err, "tcp relay failed after connect");
+            Err(AppError::Io(err))
+        }
     }
 }
 
@@ -209,19 +232,28 @@ async fn serve_udp_associate(
     config: &ClientConfigFile,
     pool: &TunnelPool,
 ) -> Result<(), AppError> {
-    let mut tunnel = pool.acquire().await?;
+    let mut tunnel = tokio::time::timeout(TUNNEL_ACQUIRE_TIMEOUT, pool.acquire())
+        .await
+        .map_err(|_| AppError::Boxed(format!("acquire udp tunnel timed out for {peer}")))??;
     write_open_udp(&mut tunnel).await?;
-    if let Err(err) = read_response(&mut tunnel).await {
+    if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
+        .await
+        .map_err(|_| AppError::Boxed(format!("wait udp tunnel response timed out for {peer}")))?
+    {
+        warn!(client = %peer, error = %err, "tunnel open udp failed");
         server::Reply::error_reply(ReplyKind::GeneralServerFailure)
             .write_to(&mut tcp_stream)
             .await?;
         return Err(err);
     }
+    info!(client = %peer, "udp tunnel connected");
 
     let udp_bind = SocketAddr::new(parse_bind_ip(&config.socks5.bind)?, 0);
     let udp_socket = UdpSocket::bind(udp_bind).await?;
     let reply_addr = HostWithPort::from(udp_socket.local_addr()?);
-    server::Reply::new(reply_addr).write_to(&mut tcp_stream).await?;
+    server::Reply::new(reply_addr)
+        .write_to(&mut tcp_stream)
+        .await?;
 
     let idle_timeout = Duration::from_secs(config.udp.idle_timeout_secs.max(5));
     let mut udp_buf = vec![0u8; 65535];
@@ -257,7 +289,7 @@ async fn serve_udp_associate(
                         last_activity = Instant::now();
                     }
                 } else if opcode_is_close(opcode) {
-                    debug!(client = %peer, "udp tunnel closed by server");
+                    info!(client = %peer, "udp tunnel closed by server");
                     return Ok(());
                 } else if opcode_is_pong(opcode) {
                     last_activity = Instant::now();
@@ -270,7 +302,7 @@ async fn serve_udp_associate(
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 if last_activity.elapsed() >= idle_timeout {
                     let _ = write_close(&mut tunnel).await;
-                    debug!(client = %peer, "udp associate idle timeout reached");
+                    info!(client = %peer, "udp associate idle timeout reached");
                     return Ok(());
                 }
                 if last_activity.elapsed() >= Duration::from_secs(15) {
@@ -280,7 +312,7 @@ async fn serve_udp_associate(
             read = tokio::io::copy(&mut tcp_stream, &mut drain_sink) => {
                 let _ = read?;
                 let _ = write_close(&mut tunnel).await;
-                debug!(client = %peer, "udp associate tcp control stream closed");
+                info!(client = %peer, "udp associate tcp control stream closed");
                 return Ok(());
             }
         }

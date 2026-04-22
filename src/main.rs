@@ -4,14 +4,17 @@ mod config;
 mod error;
 mod logging;
 mod server_runtime;
+mod server_stats;
 mod tls;
 mod tunnel;
+mod ui;
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use clap::Parser;
 
-use crate::cli::{Cli, ClientCommand, Command, ModeAction, ServerCommand};
+use crate::cli::{Cli, ClientCommand, Command, ModeAction, ServerCommand, UiCommand};
 use crate::config::{ClientConfigFile, ServerConfigFile};
 use crate::error::AppError;
 
@@ -22,6 +25,7 @@ async fn main() -> Result<(), AppError> {
     match cli.command {
         Command::Server(cmd) => handle_server(cmd).await,
         Command::Client(cmd) => handle_client(cmd).await,
+        Command::Ui(cmd) => handle_ui(cmd).await,
         Command::Version => {
             println!(
                 "{} {} ({})",
@@ -48,18 +52,29 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
             config.validate()?;
             println!(
                 "server config valid: bind={}:{}, outbound_ip_mode={}, tls={}",
-                config.server.bind, config.server.port, config.server.outbound_ip_mode, config.tls.enabled
+                config.server.bind,
+                config.server.port,
+                config.server.outbound_ip_mode,
+                config.tls.enabled
             );
             Ok(())
         }
+        Some(ModeAction::Stats { stats_socket }) => {
+            let path = stats_socket.unwrap_or(cmd.stats_socket);
+            server_stats::print_snapshot(&path).await
+        }
         None => {
             if cmd.daemon {
-                return spawn_daemon("server", &cmd.config);
+                let extra_args = vec![
+                    OsString::from("--stats-socket"),
+                    cmd.stats_socket.as_os_str().to_os_string(),
+                ];
+                return spawn_daemon("server", &cmd.config, &extra_args);
             }
             let config = ServerConfigFile::from_path(&cmd.config)?;
             config.validate()?;
             logging::init(&config.log.level)?;
-            server_runtime::run(config).await
+            server_runtime::run(config, cmd.stats_socket).await
         }
     }
 }
@@ -86,9 +101,12 @@ async fn handle_client(cmd: ClientCommand) -> Result<(), AppError> {
             );
             Ok(())
         }
+        Some(ModeAction::Stats { .. }) => Err(AppError::InvalidConfig(
+            "client stats is not supported; use `rama-proxy server stats`".to_string(),
+        )),
         None => {
             if cmd.daemon {
-                return spawn_daemon("client", &cmd.config);
+                return spawn_daemon("client", &cmd.config, &[]);
             }
             let config = ClientConfigFile::from_path(&cmd.config)?;
             config.validate()?;
@@ -98,12 +116,23 @@ async fn handle_client(cmd: ClientCommand) -> Result<(), AppError> {
     }
 }
 
-fn spawn_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
+async fn handle_ui(cmd: UiCommand) -> Result<(), AppError> {
+    logging::init("info")?;
+    ui::run(cmd).await
+}
+
+fn spawn_daemon(mode: &str, config_path: &Path, extra_args: &[OsString]) -> Result<(), AppError> {
     let exe = std::env::current_exe()?;
     let stem = format!("rama-proxy-{mode}");
 
-    let log_path = config_path.parent().unwrap_or(Path::new(".")).join(format!("{stem}.out"));
-    let pid_path = config_path.parent().unwrap_or(Path::new(".")).join(format!("{stem}.pid"));
+    let log_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}.out"));
+    let pid_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}.pid"));
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -115,6 +144,7 @@ fn spawn_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
     cmd.arg(mode)
         .arg("--config")
         .arg(config_path)
+        .args(extra_args)
         .stdout(log_file)
         .stderr(err_file)
         .stdin(std::process::Stdio::null());

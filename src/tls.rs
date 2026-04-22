@@ -5,8 +5,7 @@ use std::sync::Arc;
 use rama::tls::rustls::{
     dep::{
         rustls::{
-            self,
-            RootCertStore, ServerConfig,
+            self, RootCertStore, ServerConfig,
             pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
             server::WebPkiClientVerifier,
         },
@@ -28,7 +27,9 @@ pub struct ClientTlsContext {
 
 pub type ServerTlsAcceptor = TlsAcceptor;
 
-pub fn build_client_tls_context(config: &ClientTlsConfig) -> Result<Option<ClientTlsContext>, AppError> {
+pub fn build_client_tls_context(
+    config: &ClientTlsConfig,
+) -> Result<Option<ClientTlsContext>, AppError> {
     if !config.enabled {
         return Ok(None);
     }
@@ -52,7 +53,9 @@ pub fn build_client_tls_context(config: &ClientTlsConfig) -> Result<Option<Clien
     }))
 }
 
-pub fn build_server_tls_acceptor(config: &ServerTlsConfig) -> Result<Option<TlsAcceptor>, AppError> {
+pub fn build_server_tls_acceptor(
+    config: &ServerTlsConfig,
+) -> Result<Option<TlsAcceptor>, AppError> {
     if !config.enabled {
         return Ok(None);
     }
@@ -70,11 +73,15 @@ pub fn build_server_tls_acceptor(config: &ServerTlsConfig) -> Result<Option<TlsA
             .map_err(|err| AppError::Boxed(format!("build server tls config failed: {err}")))?
     } else {
         TlsAcceptorDataBuilder::new(certs, key)
-            .map_err(|err| AppError::Boxed(format!("build server tls acceptor data failed: {err}")))?
+            .map_err(|err| {
+                AppError::Boxed(format!("build server tls acceptor data failed: {err}"))
+            })?
             .into_rustls_config()
     };
 
-    Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(server_config))))
+    Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(
+        server_config,
+    ))))
 }
 
 fn client_auth_material(
@@ -93,9 +100,9 @@ fn client_auth_material(
 fn load_root_store(path: &str) -> Result<RootCertStore, AppError> {
     let mut store = RootCertStore::empty();
     for cert in load_certificates(path)? {
-        store
-            .add(cert)
-            .map_err(|err| AppError::Boxed(format!("add certificate to root store failed: {err}")))?;
+        store.add(cert).map_err(|err| {
+            AppError::Boxed(format!("add certificate to root store failed: {err}"))
+        })?;
     }
     Ok(store)
 }

@@ -283,10 +283,9 @@ impl ClientConfigFile {
 
     pub fn validate(&self) -> Result<(), AppError> {
         validate_ip_bind(&self.socks5.bind, "socks5.bind")?;
-        self.client
-            .server_addr
-            .parse::<SocketAddr>()
-            .map_err(|_| AppError::InvalidConfig("client.server_addr must be host:port".to_string()))?;
+        self.client.server_addr.parse::<SocketAddr>().map_err(|_| {
+            AppError::InvalidConfig("client.server_addr must be host:port".to_string())
+        })?;
         if self.client.shared_secret.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "client.shared_secret must not be empty".to_string(),

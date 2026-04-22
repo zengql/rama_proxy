@@ -1,21 +1,20 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rama::net::address::{Host, HostWithPort};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::{
-    config::TunnelClientConfig,
-    tls::ClientTlsContext,
-};
 use crate::error::AppError;
+use crate::{config::TunnelClientConfig, tls::ClientTlsContext};
 
 const MAGIC: &[u8; 4] = b"RPT1";
 const VERSION: u8 = 1;
@@ -33,7 +32,7 @@ const STATUS_AUTH_FAILED: u8 = 0x01;
 const STATUS_BAD_REQUEST: u8 = 0x02;
 const STATUS_CONNECT_FAILED: u8 = 0x03;
 const STATUS_RESOLVE_FAILED: u8 = 0x04;
-
+const IDLE_TUNNEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub struct TunnelPool {
     server_addr: SocketAddr,
@@ -43,6 +42,7 @@ pub struct TunnelPool {
     idle_rx: Arc<Mutex<mpsc::Receiver<TunnelStream>>>,
     desired_size: usize,
     connecting: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
     tls: Option<ClientTlsContext>,
 }
 
@@ -52,15 +52,19 @@ impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type TunnelStream = Box<dyn TunnelIo>;
 
+pub struct TunnelLease {
+    inner: TunnelStream,
+    active: Arc<AtomicUsize>,
+}
+
 impl TunnelPool {
     pub fn new(
         config: &TunnelClientConfig,
         tls: Option<ClientTlsContext>,
     ) -> Result<Self, AppError> {
-        let server_addr = config
-            .server_addr
-            .parse::<SocketAddr>()
-            .map_err(|_| AppError::InvalidConfig("client.server_addr must be host:port".to_string()))?;
+        let server_addr = config.server_addr.parse::<SocketAddr>().map_err(|_| {
+            AppError::InvalidConfig("client.server_addr must be host:port".to_string())
+        })?;
         let (idle_tx, idle_rx) = mpsc::channel(config.pool_size);
         Ok(Self {
             server_addr,
@@ -70,6 +74,7 @@ impl TunnelPool {
             idle_rx: Arc::new(Mutex::new(idle_rx)),
             desired_size: config.pool_size,
             connecting: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
             tls,
         })
     }
@@ -80,7 +85,8 @@ impl TunnelPool {
             loop {
                 let idle = this.idle_len();
                 let connecting = this.connecting.load(Ordering::Relaxed);
-                let total = idle.saturating_add(connecting);
+                let active = this.active.load(Ordering::Relaxed);
+                let total = idle.saturating_add(connecting).saturating_add(active);
                 if total < this.desired_size {
                     let missing = this.desired_size - total;
                     for _ in 0..missing {
@@ -105,7 +111,8 @@ impl TunnelPool {
         let tls = self.tls.clone();
         connecting.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            let result = connect_idle_tunnel(server_addr, &shared_secret, connect_timeout, tls).await;
+            let result =
+                connect_idle_tunnel(server_addr, &shared_secret, connect_timeout, tls).await;
             connecting.fetch_sub(1, Ordering::SeqCst);
             match result {
                 Ok(stream) => {
@@ -120,17 +127,93 @@ impl TunnelPool {
         });
     }
 
-    pub async fn acquire(&self) -> Result<TunnelStream, AppError> {
-        if let Some(stream) = self.idle_rx.lock().await.recv().await {
-            return Ok(stream);
+    pub async fn acquire(&self) -> Result<TunnelLease, AppError> {
+        loop {
+            let next_idle = {
+                let mut idle_rx = self.idle_rx.lock().await;
+                idle_rx.try_recv().ok()
+            };
+            let Some(mut stream) = next_idle else {
+                break;
+            };
+
+            match probe_idle_tunnel(&mut stream).await {
+                Ok(()) => {
+                    self.active.fetch_add(1, Ordering::SeqCst);
+                    return Ok(TunnelLease {
+                        inner: stream,
+                        active: self.active.clone(),
+                    });
+                }
+                Err(err) => {
+                    warn!("discarding stale idle tunnel: {err}");
+                    self.spawn_fill_one();
+                }
+            }
         }
-        connect_idle_tunnel(
+
+        let stream = connect_idle_tunnel(
             self.server_addr,
             &self.shared_secret,
             self.connect_timeout,
             self.tls.clone(),
         )
-        .await
+        .await?;
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Ok(TunnelLease {
+            inner: stream,
+            active: self.active.clone(),
+        })
+    }
+}
+
+async fn probe_idle_tunnel(stream: &mut TunnelStream) -> Result<(), AppError> {
+    tokio::time::timeout(IDLE_TUNNEL_PROBE_TIMEOUT, async {
+        write_ping(stream).await?;
+        let opcode = read_opcode(stream).await?;
+        if opcode_is_pong(opcode) {
+            Ok(())
+        } else {
+            Err(AppError::InvalidConfig(format!(
+                "unexpected opcode while probing idle tunnel: {opcode}"
+            )))
+        }
+    })
+    .await
+    .map_err(|_| AppError::InvalidConfig("idle tunnel probe timed out".to_string()))?
+}
+
+impl Drop for TunnelLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl AsyncRead for TunnelLease {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TunnelLease {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -144,6 +227,7 @@ async fn connect_idle_tunnel(
         .await
         .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))??;
     stream.set_nodelay(true)?;
+    info!(server_addr = %server_addr, tls_enabled = tls.is_some(), "created fresh tunnel connection");
     let mut stream: TunnelStream = match tls {
         Some(tls) => Box::new(
             tls.connector
@@ -346,8 +430,9 @@ where
     R: AsyncRead + Unpin,
 {
     let raw = read_string(reader).await?;
-    raw.parse::<HostWithPort>()
-        .map_err(|err| AppError::InvalidConfig(format!("invalid host-with-port in tunnel frame: {err}")))
+    raw.parse::<HostWithPort>().map_err(|err| {
+        AppError::InvalidConfig(format!("invalid host-with-port in tunnel frame: {err}"))
+    })
 }
 
 async fn write_string<W>(writer: &mut W, value: &str) -> Result<(), AppError>

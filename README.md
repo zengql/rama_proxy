@@ -28,20 +28,99 @@ Out of scope:
 ```powershell
 rama-proxy server init
 rama-proxy server check
+rama-proxy server stats
 rama-proxy server --config config/server.toml
 
 rama-proxy client init
 rama-proxy client check
 rama-proxy client --config config/client.toml
+
+rama-proxy ui
+rama-proxy ui --port 19091
+rama-proxy ui --pid-file config/rama-proxy-server.pid
 ```
 
 Command notes:
 
 - `server` starts the remote tunnel server when no nested command is provided
+- `server stats` prints the latest server connection snapshot JSON
 - `client` starts the local Clash-facing SOCKS5 service when no nested command is provided
+- `ui` starts a built-in web UI for observing a running `server` process on Linux
 - `init` writes a default config file for that mode
 - `check` validates the config file and exits
 - `--daemon` can be used with either `server` or `client`
+
+## Web UI
+
+The built-in UI is a separate process inside the same binary.
+
+Default behavior:
+
+- bind: `127.0.0.1`
+- port: `19091`
+- pid file: `config/rama-proxy-server.pid`
+
+Example:
+
+```powershell
+rama-proxy server --config config/server.toml --daemon
+rama-proxy server stats
+rama-proxy ui
+```
+
+Then open:
+
+- `http://127.0.0.1:19091/`
+
+Supported flags:
+
+- `--bind <ip>`
+- `--port <port>`
+- `--pid-file <path>`
+- `--stats-socket <path>`
+- `--interval-ms <millis>`
+
+Current UI data comes from polling `/proc/<pid>` on Linux, so:
+
+- it is intended to observe a running remote `server` process
+- it does not require changing the `server` runtime path
+- fd and socket "observed duration" means "how long the UI has seen this item", not the exact kernel creation timestamp
+
+Current pages and APIs:
+
+- `/`: HTML dashboard
+- `/api/snapshot`: JSON snapshot
+- `/healthz`: health check
+
+## Server Stats Snapshot
+
+When `server` runs, it serves a protocol-level connection snapshot over a local admin socket.
+
+Default behavior:
+
+- stats socket: `config/rama-proxy-server.stats.sock`
+
+Example:
+
+```powershell
+rama-proxy server --config config/server.toml --stats-socket config/rama-proxy-server.stats.sock
+rama-proxy server stats --stats-socket config/rama-proxy-server.stats.sock
+```
+
+The snapshot includes:
+
+- current tunnel count
+- `handshake` / `idle` / `active-tcp` / `active-udp` counts
+- whether each tunnel is currently in use
+- client address
+- target address
+- upstream address
+- accepted time
+- last active time
+- age / idle seconds
+- bytes from client / bytes from target
+
+This data comes from the `server` protocol path itself, not from `/proc` inference. The running server exposes it on a local admin socket, and `server stats` prints the current snapshot to stdout for external tooling to collect.
 
 ## Architecture
 
@@ -85,6 +164,7 @@ Notes:
 
 - `server.bind` is the remote listen IP
 - `server.port` is the tunnel port used by clients
+- `--stats-socket` controls where the local admin stats socket is created
 - `outbound_ip_mode` controls how the remote server connects to target addresses
 - `auth.shared_secret` must match the client config
 - enable `[tls]` to protect the tunnel with server certificate based TLS
@@ -129,7 +209,7 @@ format = "text"
 Notes:
 
 - `client.server_addr` points to the remote `rama-proxy server`
-- `client.pool_size` controls how many idle tunnels the client keeps ready
+- `client.pool_size` controls the minimum total warm tunnel count; the client consumes this pool first and creates temporary extra tunnels only when concurrent demand exceeds the pool
 - `socks5.bind` and `socks5.port` define the local endpoint for Clash Party
 - `udp.enabled` enables local SOCKS5 `UDP ASSOCIATE`
 - `auth` controls local SOCKS5 authentication between Clash Party and the local client
