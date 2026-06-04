@@ -1,46 +1,60 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use rama::{
     extensions::Extensions,
     net::{
         address::HostWithPort,
         mode::{ConnectIpMode, DnsResolveIpMode},
+        stream::Socket,
     },
     tcp::client::default_tcp_connect,
 };
 use tokio::{
     io::copy_bidirectional,
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ServerConfigFile,
     error::AppError,
+    server_stats::{ServerStatsRegistry, spawn_stats_server},
+    tls::{ServerTlsAcceptor, build_server_tls_acceptor},
     tunnel::{
         opcode_is_close, opcode_is_connect, opcode_is_ping, opcode_is_udp, opcode_is_udp_packet,
-        read_connect_target, read_opcode, read_udp_packet, server_handshake,
-        status_connect_failed, status_resolve_failed, write_pong, write_response, write_udp_packet,
+        read_connect_target, read_opcode, read_udp_packet, server_handshake, status_connect_failed,
+        status_resolve_failed, write_pong, write_response, write_udp_packet,
     },
 };
 
-pub async fn run(config: ServerConfigFile) -> Result<(), AppError> {
+const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), AppError> {
     let bind_ip = parse_bind_ip(&config.server.bind)?;
     let listen_addr = SocketAddr::new(bind_ip, config.server.port);
     let listener = bind_listener(listen_addr).await?;
+    let tls_acceptor = build_server_tls_acceptor(&config.tls)?;
+    let stats = ServerStatsRegistry::new();
+    spawn_stats_server(stats.clone(), stats_socket.clone());
 
     info!(
         bind = %listen_addr,
         outbound_ip_mode = %config.server.outbound_ip_mode,
+        tls_enabled = config.tls.enabled,
+        stats_socket = %stats_socket.display(),
         "tunnel server started"
     );
 
     loop {
         let (stream, peer) = accept_with_retry(&listener).await?;
         let config = config.clone();
+        let tls_acceptor = tls_acceptor.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer, config).await {
-                debug!(client = %peer, error = %err, "tunnel connection ended with error");
+            if let Err(err) = handle_connection(stream, peer, config, tls_acceptor, stats).await {
+                warn!(client = %peer, error = %err, "tunnel connection ended with error");
             }
         });
     }
@@ -84,46 +98,108 @@ fn is_retryable_accept_error(err: &std::io::Error) -> bool {
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: ServerConfigFile,
+    tls_acceptor: Option<ServerTlsAcceptor>,
+    stats: ServerStatsRegistry,
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
-    server_handshake(&mut stream, &config.auth.shared_secret).await?;
-    debug!(client = %peer, "tunnel client authenticated");
+    let connection_id = stats.register_connection(peer.to_string()).await;
+
+    let result = match tls_acceptor {
+        Some(acceptor) => {
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
+            handle_connection_io(&mut stream, peer, config, &stats, connection_id).await
+        }
+        None => {
+            let mut stream = stream;
+            handle_connection_io(&mut stream, peer, config, &stats, connection_id).await
+        }
+    };
+    stats.remove_connection(connection_id).await;
+    result
+}
+
+async fn handle_connection_io<S>(
+    stream: &mut S,
+    peer: SocketAddr,
+    config: ServerConfigFile,
+    stats: &ServerStatsRegistry,
+    connection_id: u64,
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let client_id = server_handshake(
+        stream,
+        &config.auth.shared_secret,
+        config.auth.require_client_id,
+    )
+    .await
+    .map_err(|err| {
+        warn!(client = %peer, error = %err, "tunnel handshake failed");
+        err
+    })?;
+    stats.set_client_id(connection_id, client_id.clone()).await;
+    stats.mark_idle(connection_id).await;
+    debug!(client = %peer, client_id = %client_id, "tunnel client authenticated");
 
     loop {
-        let opcode = read_opcode(&mut stream).await?;
+        let opcode = read_opcode(stream).await?;
         if opcode_is_ping(opcode) {
-            write_pong(&mut stream).await?;
+            stats.touch(connection_id).await;
+            write_pong(stream).await?;
             continue;
         }
         if opcode_is_connect(opcode) {
-            let target = read_connect_target(&mut stream).await?;
-            return serve_tcp_tunnel(stream, peer, target, &config).await;
+            let target = read_connect_target(stream).await?;
+            stats
+                .mark_active_tcp(connection_id, target.to_string())
+                .await;
+            return serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id).await;
         }
         if opcode_is_udp(opcode) {
-            return serve_udp_tunnel(stream, peer, &config).await;
+            stats.mark_active_udp(connection_id).await;
+            return serve_udp_tunnel(stream, peer, &config, stats, connection_id).await;
         }
+        error!(client = %peer, opcode, "received unknown tunnel opcode");
         return Err(AppError::InvalidConfig(format!(
             "unknown tunnel opcode from client {peer}: {opcode}"
         )));
     }
 }
 
-async fn serve_tcp_tunnel(
-    mut tunnel: TcpStream,
+async fn serve_tcp_tunnel<S>(
+    tunnel: &mut S,
     peer: SocketAddr,
     target: HostWithPort,
     config: &ServerConfigFile,
-) -> Result<(), AppError> {
+    stats: &ServerStatsRegistry,
+    connection_id: u64,
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let extensions = build_outbound_extensions(&config.server.outbound_ip_mode)?;
-    match default_tcp_connect(&extensions, target.clone()).await {
-        Ok((mut upstream, _addr)) => {
-            write_response(&mut tunnel, 0, "ok").await?;
-            let result = copy_bidirectional(&mut tunnel, &mut upstream).await;
+    let connect_result =
+        tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, default_tcp_connect(&extensions, target.clone()))
+            .await;
+    match connect_result {
+        Ok(Ok((mut upstream, _addr))) => {
+            if let Ok(addr) = upstream.peer_addr() {
+                stats.set_upstream_addr(connection_id, addr.to_string()).await;
+            }
+            write_response(tunnel, 0, "ok").await?;
+            let result = copy_bidirectional(tunnel, &mut upstream).await;
             match result {
                 Ok((up_bytes, down_bytes)) => {
+                    stats
+                        .add_tcp_bytes(connection_id, up_bytes, down_bytes)
+                        .await;
                     debug!(
                         client = %peer,
                         target = %target,
@@ -136,36 +212,58 @@ async fn serve_tcp_tunnel(
                 Err(err) => Err(AppError::Io(err)),
             }
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let (status, message) = status_connect_failed(&err.to_string());
-            write_response(&mut tunnel, status, &message).await?;
-            Err(AppError::Boxed(format!("connect target {target} failed: {err}")))
+            warn!(client = %peer, target = %target, error = %err, "connect target failed");
+            write_response(tunnel, status, &message).await?;
+            Err(AppError::Boxed(format!(
+                "connect target {target} failed: {err}"
+            )))
+        }
+        Err(_) => {
+            let message = format!("connect target {target} timed out after {}s", OUTBOUND_CONNECT_TIMEOUT.as_secs());
+            warn!(client = %peer, target = %target, timeout_secs = OUTBOUND_CONNECT_TIMEOUT.as_secs(), "outbound tcp connect timed out");
+            let (status, response_message) = status_connect_failed(&message);
+            write_response(tunnel, status, &response_message).await?;
+            Err(AppError::Boxed(message))
         }
     }
 }
 
-async fn serve_udp_tunnel(
-    mut tunnel: TcpStream,
+async fn serve_udp_tunnel<S>(
+    tunnel: &mut S,
     peer: SocketAddr,
     config: &ServerConfigFile,
-) -> Result<(), AppError> {
+    stats: &ServerStatsRegistry,
+    connection_id: u64,
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let bind_ip = parse_bind_ip(&config.server.bind)?;
     let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
-    write_response(&mut tunnel, 0, "ok").await?;
+    write_response(tunnel, 0, "ok").await?;
 
     let mut recv_buf = vec![0u8; 65535];
     loop {
         tokio::select! {
-            opcode = read_opcode(&mut tunnel) => {
+            opcode = read_opcode(tunnel) => {
                 let opcode = opcode?;
                 if opcode_is_udp_packet(opcode) {
-                    let (target, payload) = read_udp_packet(&mut tunnel).await?;
+                    let (target, payload) = read_udp_packet(tunnel).await?;
                     let remote = resolve_udp_target(&target, &config.server.outbound_ip_mode).await?;
+                    stats
+                        .add_udp_client_bytes(connection_id, target.to_string(), payload.len() as u64)
+                        .await;
+                    stats
+                        .set_upstream_addr(connection_id, remote.to_string())
+                        .await;
                     udp.send_to(&payload, remote).await?;
                 } else if opcode_is_close(opcode) {
                     debug!(client = %peer, "udp tunnel closed by client");
                     return Ok(());
                 } else {
+                    error!(client = %peer, opcode, "unexpected udp tunnel opcode");
                     return Err(AppError::InvalidConfig(format!(
                         "unexpected udp tunnel opcode from {peer}: {opcode}"
                     )));
@@ -174,7 +272,10 @@ async fn serve_udp_tunnel(
             recv = udp.recv_from(&mut recv_buf) => {
                 let (n, remote) = recv?;
                 let source = HostWithPort::from(remote);
-                write_udp_packet(&mut tunnel, &source, &recv_buf[..n]).await?;
+                stats
+                    .add_udp_target_bytes(connection_id, remote.to_string(), n as u64)
+                    .await;
+                write_udp_packet(tunnel, &source, &recv_buf[..n]).await?;
             }
         }
     }

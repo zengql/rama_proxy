@@ -14,6 +14,8 @@ pub struct ServerConfigFile {
     #[serde(default)]
     pub auth: TunnelAuthConfig,
     #[serde(default)]
+    pub tls: ServerTlsConfig,
+    #[serde(default)]
     pub log: LogConfig,
 }
 
@@ -33,6 +35,8 @@ pub struct TunnelServerConfig {
 pub struct TunnelAuthConfig {
     #[serde(default = "default_shared_secret")]
     pub shared_secret: String,
+    #[serde(default)]
+    pub require_client_id: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +50,39 @@ pub struct ClientConfigFile {
     #[serde(default)]
     pub auth: LocalAuthConfig,
     #[serde(default)]
+    pub tls: ClientTlsConfig,
+    #[serde(default)]
     pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: String,
+    #[serde(default)]
+    pub key_path: String,
+    #[serde(default)]
+    pub require_client_auth: bool,
+    #[serde(default)]
+    pub client_ca_cert_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub ca_cert_path: String,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default)]
+    pub client_cert_path: String,
+    #[serde(default)]
+    pub client_key_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +91,8 @@ pub struct TunnelClientConfig {
     pub server_addr: String,
     #[serde(default = "default_shared_secret")]
     pub shared_secret: String,
+    #[serde(default)]
+    pub client_id: String,
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
     #[serde(default = "default_connect_timeout_secs")]
@@ -104,6 +142,7 @@ impl Default for ServerConfigFile {
         Self {
             server: TunnelServerConfig::default(),
             auth: TunnelAuthConfig::default(),
+            tls: ServerTlsConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -124,6 +163,7 @@ impl Default for TunnelAuthConfig {
     fn default() -> Self {
         Self {
             shared_secret: default_shared_secret(),
+            require_client_id: false,
         }
     }
 }
@@ -135,7 +175,33 @@ impl Default for ClientConfigFile {
             socks5: LocalSocks5Config::default(),
             udp: LocalUdpConfig::default(),
             auth: LocalAuthConfig::default(),
+            tls: ClientTlsConfig::default(),
             log: LogConfig::default(),
+        }
+    }
+}
+
+impl Default for ServerTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: String::new(),
+            key_path: String::new(),
+            require_client_auth: false,
+            client_ca_cert_path: String::new(),
+        }
+    }
+}
+
+impl Default for ClientTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: String::new(),
+            ca_cert_path: String::new(),
+            insecure_skip_verify: false,
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
         }
     }
 }
@@ -145,6 +211,7 @@ impl Default for TunnelClientConfig {
         Self {
             server_addr: default_server_addr(),
             shared_secret: default_shared_secret(),
+            client_id: String::new(),
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout_secs(),
         }
@@ -190,7 +257,9 @@ impl Default for LogConfig {
 impl ServerConfigFile {
     pub fn from_path(path: &Path) -> Result<Self, AppError> {
         let content = fs::read_to_string(path)?;
-        Ok(toml::from_str::<Self>(&content)?)
+        let mut config = toml::from_str::<Self>(&content)?;
+        config.resolve_relative_paths(path);
+        Ok(config)
     }
 
     pub fn write_default_to_path(path: &Path, force: bool) -> Result<(), AppError> {
@@ -205,14 +274,26 @@ impl ServerConfigFile {
                 "auth.shared_secret must not be empty".to_string(),
             ));
         }
+        validate_server_tls_config(&self.tls)?;
         Ok(())
+    }
+
+    fn resolve_relative_paths(&mut self, path: &Path) {
+        let Some(base_dir) = path.parent() else {
+            return;
+        };
+        resolve_file_path_in_place(&mut self.tls.cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.key_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_ca_cert_path, base_dir);
     }
 }
 
 impl ClientConfigFile {
     pub fn from_path(path: &Path) -> Result<Self, AppError> {
         let content = fs::read_to_string(path)?;
-        Ok(toml::from_str::<Self>(&content)?)
+        let mut config = toml::from_str::<Self>(&content)?;
+        config.resolve_relative_paths(path);
+        Ok(config)
     }
 
     pub fn write_default_to_path(path: &Path, force: bool) -> Result<(), AppError> {
@@ -221,13 +302,17 @@ impl ClientConfigFile {
 
     pub fn validate(&self) -> Result<(), AppError> {
         validate_ip_bind(&self.socks5.bind, "socks5.bind")?;
-        self.client
-            .server_addr
-            .parse::<SocketAddr>()
-            .map_err(|_| AppError::InvalidConfig("client.server_addr must be host:port".to_string()))?;
+        self.client.server_addr.parse::<SocketAddr>().map_err(|_| {
+            AppError::InvalidConfig("client.server_addr must be host:port".to_string())
+        })?;
         if self.client.shared_secret.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "client.shared_secret must not be empty".to_string(),
+            ));
+        }
+        if self.client.client_id.contains('\n') || self.client.client_id.contains('\r') {
+            return Err(AppError::InvalidConfig(
+                "client.client_id must be a single-line string".to_string(),
             ));
         }
         if self.client.pool_size == 0 {
@@ -245,7 +330,17 @@ impl ClientConfigFile {
                 "auth.users must not be empty when auth.mode is 'password'".to_string(),
             ));
         }
+        validate_client_tls_config(&self.tls)?;
         Ok(())
+    }
+
+    fn resolve_relative_paths(&mut self, path: &Path) {
+        let Some(base_dir) = path.parent() else {
+            return;
+        };
+        resolve_file_path_in_place(&mut self.tls.ca_cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_key_path, base_dir);
     }
 }
 
@@ -264,6 +359,108 @@ fn validate_outbound_ip_mode(mode: &str) -> Result<(), AppError> {
                 .to_string(),
         )),
     }
+}
+
+fn validate_server_tls_config(tls: &ServerTlsConfig) -> Result<(), AppError> {
+    if !tls.enabled {
+        return Ok(());
+    }
+
+    require_non_empty_file(&tls.cert_path, "tls.cert_path")?;
+    require_non_empty_file(&tls.key_path, "tls.key_path")?;
+
+    if tls.require_client_auth {
+        require_non_empty_file(&tls.client_ca_cert_path, "tls.client_ca_cert_path")?;
+    } else if !tls.client_ca_cert_path.trim().is_empty() {
+        require_existing_file(&tls.client_ca_cert_path, "tls.client_ca_cert_path")?;
+    }
+
+    Ok(())
+}
+
+fn validate_client_tls_config(tls: &ClientTlsConfig) -> Result<(), AppError> {
+    if !tls.enabled {
+        return Ok(());
+    }
+
+    if tls.server_name.trim().is_empty() {
+        return Err(AppError::InvalidConfig(
+            "tls.server_name must not be empty when tls.enabled is true".to_string(),
+        ));
+    }
+
+    if tls.insecure_skip_verify {
+        return Err(AppError::InvalidConfig(
+            "tls.insecure_skip_verify is reserved and not supported yet".to_string(),
+        ));
+    }
+    require_non_empty_file(&tls.ca_cert_path, "tls.ca_cert_path")?;
+
+    let has_client_cert = !tls.client_cert_path.trim().is_empty();
+    let has_client_key = !tls.client_key_path.trim().is_empty();
+    match (has_client_cert, has_client_key) {
+        (true, true) => {
+            require_existing_file(&tls.client_cert_path, "tls.client_cert_path")?;
+            require_existing_file(&tls.client_key_path, "tls.client_key_path")?;
+        }
+        (false, false) => {}
+        _ => {
+            return Err(AppError::InvalidConfig(
+                "tls.client_cert_path and tls.client_key_path must be configured together"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn require_non_empty_file(value: &str, field: &str) -> Result<(), AppError> {
+    if value.trim().is_empty() {
+        return Err(AppError::InvalidConfig(format!(
+            "{field} must not be empty when tls is enabled"
+        )));
+    }
+    require_existing_file(value, field)
+}
+
+fn require_existing_file(value: &str, field: &str) -> Result<(), AppError> {
+    let path = Path::new(value);
+    if !path.is_file() {
+        return Err(AppError::InvalidConfig(format!(
+            "{field} must point to an existing file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_file_path_in_place(value: &mut String, base_dir: &Path) {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return;
+    }
+
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return;
+    }
+
+    let config_relative = base_dir.join(path);
+    if config_relative.is_file() {
+        *value = config_relative.to_string_lossy().into_owned();
+        return;
+    }
+
+    if let Some(runtime_root) = base_dir.parent() {
+        let root_relative = runtime_root.join(path);
+        if root_relative.is_file() {
+            *value = root_relative.to_string_lossy().into_owned();
+            return;
+        }
+    }
+
+    *value = config_relative.to_string_lossy().into_owned();
 }
 
 fn write_default_template(path: &Path, force: bool, content: String) -> Result<(), AppError> {
@@ -340,6 +537,14 @@ workers = 0
 
 [auth]
 shared_secret = "change-me"
+require_client_id = false
+
+[tls]
+enabled = false
+cert_path = ""
+key_path = ""
+require_client_auth = false
+client_ca_cert_path = ""
 
 [log]
 level = "info"
@@ -354,6 +559,7 @@ fn default_client_template() -> String {
 [client]
 server_addr = "127.0.0.1:19090"
 shared_secret = "change-me"
+client_id = ""
 pool_size = 8
 connect_timeout_secs = 10
 
@@ -368,6 +574,14 @@ idle_timeout_secs = 60
 [auth]
 mode = "none"
 users = []
+
+[tls]
+enabled = false
+server_name = ""
+ca_cert_path = ""
+insecure_skip_verify = false
+client_cert_path = ""
+client_key_path = ""
 
 [log]
 level = "info"
