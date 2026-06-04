@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ServerConfigFile,
@@ -54,7 +54,7 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
         let stats = stats.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, peer, config, tls_acceptor, stats).await {
-                debug!(client = %peer, error = %err, "tunnel connection ended with error");
+                warn!(client = %peer, error = %err, "tunnel connection ended with error");
             }
         });
     }
@@ -134,9 +134,19 @@ async fn handle_connection_io<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    server_handshake(stream, &config.auth.shared_secret).await?;
+    let client_id = server_handshake(
+        stream,
+        &config.auth.shared_secret,
+        config.auth.require_client_id,
+    )
+    .await
+    .map_err(|err| {
+        warn!(client = %peer, error = %err, "tunnel handshake failed");
+        err
+    })?;
+    stats.set_client_id(connection_id, client_id.clone()).await;
     stats.mark_idle(connection_id).await;
-    debug!(client = %peer, "tunnel client authenticated");
+    debug!(client = %peer, client_id = %client_id, "tunnel client authenticated");
 
     loop {
         let opcode = read_opcode(stream).await?;
@@ -156,6 +166,7 @@ where
             stats.mark_active_udp(connection_id).await;
             return serve_udp_tunnel(stream, peer, &config, stats, connection_id).await;
         }
+        error!(client = %peer, opcode, "received unknown tunnel opcode");
         return Err(AppError::InvalidConfig(format!(
             "unknown tunnel opcode from client {peer}: {opcode}"
         )));
@@ -203,6 +214,7 @@ where
         }
         Ok(Err(err)) => {
             let (status, message) = status_connect_failed(&err.to_string());
+            warn!(client = %peer, target = %target, error = %err, "connect target failed");
             write_response(tunnel, status, &message).await?;
             Err(AppError::Boxed(format!(
                 "connect target {target} failed: {err}"
@@ -251,6 +263,7 @@ where
                     debug!(client = %peer, "udp tunnel closed by client");
                     return Ok(());
                 } else {
+                    error!(client = %peer, opcode, "unexpected udp tunnel opcode");
                     return Err(AppError::InvalidConfig(format!(
                         "unexpected udp tunnel opcode from {peer}: {opcode}"
                     )));

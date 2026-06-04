@@ -230,6 +230,7 @@ impl UiSnapshot {
 struct Summary {
     total_fds: usize,
     socket_fds: usize,
+    socket_entries: usize,
     anon_inode_fds: usize,
     pipe_fds: usize,
     file_fds: usize,
@@ -558,6 +559,7 @@ fn extract_inode(target: &str, prefix: &str, suffix: char) -> Option<u64> {
 }
 
 fn classify_socket(entry: &SocketEntry, summary: &mut Summary) {
+    summary.socket_entries += 1;
     if entry.is_listener {
         summary.listener_sockets += 1;
     }
@@ -1104,6 +1106,7 @@ fn index_html() -> &'static str {
         },
         tunnel: {
           total: connections.length,
+          handshake: connections.filter((item) => item.state === 'handshake').length,
           idle: connections.filter((item) => item.state === 'idle').length,
           inUse: connections.filter((item) => item.in_use).length,
           activeTcp: connections.filter((item) => item.state === 'active-tcp').length,
@@ -1793,6 +1796,12 @@ fn index_html_v2() -> &'static str {
       return addr;
     }
 
+    function clientGroupKey(item) {
+      const addr = item && item.client_addr ? item.client_addr : item;
+      if (item && item.client_id && item.client_id !== addr) return item.client_id;
+      return parseClientHost(addr);
+    }
+
     function listenerSummary(snapshot) {
       const listeners = (snapshot.sockets || []).filter((item) => item.is_listener);
       if (!listeners.length) return '无监听 socket';
@@ -1803,7 +1812,7 @@ fn index_html_v2() -> &'static str {
       const connections = ((snapshot.live_stats && snapshot.live_stats.connections) || []);
       const groups = new Map();
       for (const item of connections) {
-        const key = parseClientHost(item.client_addr);
+        const key = clientGroupKey(item);
         if (!groups.has(key)) {
           groups.set(key, {
             key,
@@ -1815,6 +1824,7 @@ fn index_html_v2() -> &'static str {
             inUse: 0,
             bytesFromClient: 0,
             bytesFromTarget: 0,
+            source: 'stats',
           });
         }
         const group = groups.get(key);
@@ -1826,10 +1836,78 @@ fn index_html_v2() -> &'static str {
         group.bytesFromClient += item.bytes_from_client || 0;
         group.bytesFromTarget += item.bytes_from_target || 0;
       }
+      if (!connections.length) {
+        for (const item of (snapshot.sockets || [])) {
+          if (item.role !== 'client-srv') continue;
+          const key = parseClientHost(item.remote_addr);
+          if (!groups.has(key)) {
+            groups.set(key, {
+              key,
+              label: key,
+              total: 0,
+              idle: 0,
+              activeTcp: 0,
+              activeUdp: 0,
+              inUse: 0,
+              bytesFromClient: 0,
+              bytesFromTarget: 0,
+              source: 'proc',
+            });
+          }
+          groups.get(key).total += 1;
+        }
+      }
       return Array.from(groups.values()).sort((a, b) => {
         if (b.total !== a.total) return b.total - a.total;
         return a.label.localeCompare(b.label);
       });
+    }
+
+    function computeClientSummary(snapshot, clientKey) {
+      const connections = ((snapshot.live_stats && snapshot.live_stats.connections) || [])
+        .filter((item) => clientGroupKey(item) === clientKey);
+      const clientAddrs = new Set(
+        connections.map((item) => item.client_addr).filter((value) => value)
+      );
+      const upstreamAddrs = new Set(
+        connections.map((item) => item.upstream_addr).filter((value) => value)
+      );
+
+      const sockets = (snapshot.sockets || []).filter((item) => {
+        if (item.role === 'client-srv') {
+          return clientAddrs.has(item.remote_addr) || parseClientHost(item.remote_addr) === clientKey;
+        }
+        if (item.role === 'srv-external') return upstreamAddrs.has(item.remote_addr);
+        return false;
+      });
+      const socketInodes = new Set(sockets.map((item) => item.inode));
+      const fds = (snapshot.fds || []).filter((item) => {
+        if (item.inode && socketInodes.has(item.inode)) return true;
+        if (item.socket && socketInodes.has(item.socket.inode)) return true;
+        return false;
+      });
+
+      return {
+        fd: {
+          total: fds.length,
+          clientSrv: fds.filter((item) => item.role === 'client-srv').length,
+          srvExternal: fds.filter((item) => item.role === 'srv-external').length,
+          srvInternal: fds.filter((item) => item.role === 'srv-internal').length,
+        },
+        socket: {
+          total: sockets.length,
+          clientSrv: sockets.filter((item) => item.role === 'client-srv').length,
+          srvExternal: sockets.filter((item) => item.role === 'srv-external').length,
+          srvInternal: sockets.filter((item) => item.role === 'srv-internal').length,
+        },
+        tunnel: {
+          total: connections.length,
+          idle: connections.filter((item) => item.state === 'idle').length,
+          inUse: connections.filter((item) => item.in_use).length,
+          activeTcp: connections.filter((item) => item.state === 'active-tcp').length,
+          activeUdp: connections.filter((item) => item.state === 'active-udp').length,
+        },
+      };
     }
 
     function ensureActiveClient(snapshot) {
@@ -1922,7 +2000,7 @@ fn index_html_v2() -> &'static str {
           tagClass: 'socket',
           title: '套接字',
           items: [
-            ['总 Socket', summary.socket_fds ?? 0],
+            ['总 Socket', summary.socket_entries ?? 0],
             ['client → srv', summary.client_srv_sockets ?? 0],
             ['srv → external', summary.srv_external_sockets ?? 0],
             ['srv internal', summary.srv_internal_sockets ?? 0],
@@ -1934,6 +2012,7 @@ fn index_html_v2() -> &'static str {
           title: '通道',
           items: [
             ['总数', tunnel.total_connections ?? 0],
+            ['Handshake', tunnel.handshake_connections ?? 0],
             ['Idle', tunnel.idle_connections ?? 0],
             ['In Use', tunnel.in_use_connections ?? 0],
             ['Active TCP', tunnel.active_tcp_connections ?? 0],
@@ -1964,9 +2043,14 @@ fn index_html_v2() -> &'static str {
     function renderClientTabs(snapshot) {
       const groups = getClientGroups(snapshot).filter((group) => {
         if (!clientSearchTerm) return true;
-        return `${group.label} ${group.total}`.toLowerCase().includes(clientSearchTerm);
+        return `${group.label} ${group.total} ${group.source}`.toLowerCase().includes(clientSearchTerm);
       });
-      const tabs = groups.map((group) => ({ key: group.key, label: group.label, count: group.total }));
+      const tabs = groups.map((group) => ({
+        key: group.key,
+        label: group.label,
+        count: group.total,
+        source: group.source,
+      }));
       /*
       const tabs = [
         { key: 'all', label: '全部 client', count: tunnelSummary.total_connections || 0 },
@@ -1975,7 +2059,7 @@ fn index_html_v2() -> &'static str {
       */
       clientTabs.innerHTML = tabs.map((tab) => `
         <button class="client-tab ${tab.key === activeClientKey ? 'active' : ''}" data-client-key="${escapeHtml(tab.key)}">
-          <span>${escapeHtml(tab.label)}</span>
+          <span>${escapeHtml(tab.label)}${tab.source === 'proc' ? ' · proc' : ''}</span>
           <strong>${escapeHtml(tab.count)}</strong>
         </button>
       `).join('');
@@ -2034,7 +2118,7 @@ fn index_html_v2() -> &'static str {
       const stats = selected ? computeClientSummary(snapshot, selected.key) : {
         fd: { total: 0, clientSrv: 0, srvExternal: 0, srvInternal: 0 },
         socket: { total: 0, clientSrv: 0, srvExternal: 0, srvInternal: 0 },
-        tunnel: { total: 0, idle: 0, inUse: 0, activeTcp: 0, activeUdp: 0 },
+        tunnel: { total: 0, handshake: 0, idle: 0, inUse: 0, activeTcp: 0, activeUdp: 0 },
       };
       const sections = [
         {
@@ -2065,6 +2149,7 @@ fn index_html_v2() -> &'static str {
           title: selected ? selected.label : '-',
           items: [
             ['总数', stats.tunnel.total],
+            ['Handshake', stats.tunnel.handshake],
             ['Idle', stats.tunnel.idle],
             ['In Use', stats.tunnel.inUse],
             ['Active TCP', stats.tunnel.activeTcp],
@@ -2139,6 +2224,7 @@ fn index_html_v2() -> &'static str {
     function renderTunnels(snapshot) {
       renderFilterChips(tunnelStateChips, [
         { key: 'all', label: '全部' },
+        { key: 'handshake', label: 'handshake' },
         { key: 'active-tcp', label: 'active-tcp' },
         { key: 'active-udp', label: 'active-udp' },
         { key: 'idle', label: 'idle' },
@@ -2148,7 +2234,7 @@ fn index_html_v2() -> &'static str {
       });
 
       const rows = ((snapshot.live_stats && snapshot.live_stats.connections) || []).filter((item) => {
-        const clientKey = parseClientHost(item.client_addr);
+        const clientKey = clientGroupKey(item);
         if (clientKey !== activeClientKey) return false;
         if (tunnelStateFilter !== 'all' && item.state !== tunnelStateFilter) return false;
         if (!tunnelSearchTerm) return true;
@@ -2156,6 +2242,7 @@ fn index_html_v2() -> &'static str {
           item.id,
           item.state,
           item.in_use,
+          item.client_id || '',
           item.client_addr,
           clientKey,
           item.target_addr || '',

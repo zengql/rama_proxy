@@ -23,6 +23,9 @@ use crate::{
 pub struct ClientTlsContext {
     pub connector: TlsConnector,
     pub server_name: ServerName<'static>,
+    pub server_name_display: String,
+    pub client_auth_configured: bool,
+    pub backend: &'static str,
 }
 
 pub type ServerTlsAcceptor = TlsAcceptor;
@@ -37,6 +40,7 @@ pub fn build_client_tls_context(
     let root_store = load_root_store(&config.ca_cert_path)?;
 
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    let client_auth_configured = has_client_auth_material(config);
     let client_config = match client_auth_material(config)? {
         Some((certs, key)) => builder
             .with_client_auth_cert(certs, key)
@@ -50,6 +54,9 @@ pub fn build_client_tls_context(
     Ok(Some(ClientTlsContext {
         connector: TlsConnector::from(Arc::new(client_config)),
         server_name,
+        server_name_display: config.server_name.clone(),
+        client_auth_configured,
+        backend: "rustls",
     }))
 }
 
@@ -87,7 +94,7 @@ pub fn build_server_tls_acceptor(
 fn client_auth_material(
     config: &ClientTlsConfig,
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>, AppError> {
-    if config.client_cert_path.trim().is_empty() || config.client_key_path.trim().is_empty() {
+    if !has_client_auth_material(config) {
         return Ok(None);
     }
 
@@ -95,6 +102,10 @@ fn client_auth_material(
         load_certificates(&config.client_cert_path)?,
         load_private_key(&config.client_key_path)?,
     )))
+}
+
+fn has_client_auth_material(config: &ClientTlsConfig) -> bool {
+    !config.client_cert_path.trim().is_empty() && !config.client_key_path.trim().is_empty()
 }
 
 fn load_root_store(path: &str) -> Result<RootCertStore, AppError> {

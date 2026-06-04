@@ -34,6 +34,7 @@ impl ServerStatsRegistry {
         let now = now_unix_secs();
         let entry = LiveConnection {
             id,
+            client_id: String::new(),
             client_addr,
             state: "handshake".to_string(),
             accepted_at_unix_secs: now,
@@ -46,6 +47,14 @@ impl ServerStatsRegistry {
         };
         self.connections.write().await.insert(id, entry);
         id
+    }
+
+    pub async fn set_client_id(&self, id: u64, client_id: String) {
+        self.update(id, |entry| {
+            entry.client_id = client_id.clone();
+            entry.last_active_unix_secs = now_unix_secs();
+        })
+        .await;
     }
 
     pub async fn mark_idle(&self, id: u64) {
@@ -160,6 +169,7 @@ impl ServerStatsRegistry {
                 .into_iter()
                 .map(|item| ConnectionSnapshot {
                     id: item.id,
+                    client_id: item.client_id,
                     client_addr: item.client_addr,
                     state: item.state,
                     accepted_at_unix_secs: item.accepted_at_unix_secs,
@@ -211,6 +221,8 @@ pub struct ServerStatsSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionSnapshot {
     pub id: u64,
+    #[serde(default)]
+    pub client_id: String,
     pub client_addr: String,
     pub state: String,
     pub accepted_at_unix_secs: u64,
@@ -228,6 +240,7 @@ pub struct ConnectionSnapshot {
 #[derive(Debug, Clone)]
 struct LiveConnection {
     id: u64,
+    client_id: String,
     client_addr: String,
     state: String,
     accepted_at_unix_secs: u64,

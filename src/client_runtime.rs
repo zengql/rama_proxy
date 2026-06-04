@@ -187,7 +187,11 @@ async fn serve_connect(
         .await
         .map_err(|_| AppError::Boxed(format!(
             "acquire tunnel timed out for {peer} -> {destination}"
-        )))??;
+        )))?
+        .map_err(|err| {
+            warn!(client = %peer, destination = %destination, error = %err, "acquire tunnel failed");
+            err
+        })?;
     write_open_connect(&mut tunnel, &destination).await?;
     if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
         .await
@@ -234,7 +238,11 @@ async fn serve_udp_associate(
 ) -> Result<(), AppError> {
     let mut tunnel = tokio::time::timeout(TUNNEL_ACQUIRE_TIMEOUT, pool.acquire())
         .await
-        .map_err(|_| AppError::Boxed(format!("acquire udp tunnel timed out for {peer}")))??;
+        .map_err(|_| AppError::Boxed(format!("acquire udp tunnel timed out for {peer}")))?
+        .map_err(|err| {
+            warn!(client = %peer, error = %err, "acquire udp tunnel failed");
+            err
+        })?;
     write_open_udp(&mut tunnel).await?;
     if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
         .await

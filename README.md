@@ -209,7 +209,9 @@ format = "text"
 Notes:
 
 - `client.server_addr` points to the remote `rama-proxy server`
-- `client.pool_size` controls the minimum total warm tunnel count; the client consumes this pool first and creates temporary extra tunnels only when concurrent demand exceeds the pool
+- `client.pool_size` is the target idle prebuilt tunnel count; startup and every tunnel checkout immediately trigger async refill back to that target, and `idle + maintenance-hold + connecting` never exceeds this limit
+- idle tunnel connections are health-checked in the background; stale connections are discarded and replenished immediately
+- `tls.client_cert_path` and `tls.client_key_path` are optional; when both are empty the client only verifies the server certificate and does not perform mutual TLS
 - `socks5.bind` and `socks5.port` define the local endpoint for Clash Party
 - `udp.enabled` enables local SOCKS5 `UDP ASSOCIATE`
 - `auth` controls local SOCKS5 authentication between Clash Party and the local client
@@ -428,7 +430,10 @@ This version is focused on a stable first cut:
 
 - TCP requests use a tunnel connection that is opened by the local client and switched into raw relay mode after the server confirms the target
 - UDP associate uses one tunnel TCP control connection plus one local UDP socket per SOCKS5 association
-- the client maintains a pool of pre-authenticated idle tunnel connections
+- the client maintains a warm pool of pre-authenticated idle tunnel connections up to `client.pool_size` and creates extra tunnels on demand
+- the pool now performs background idle health checks and removes stale tunnels proactively
+- warm-pool refill immediately schedules the full missing tunnel count and backs off exponentially after repeated TLS or handshake failures
+- when acquire sees a small number of stale idle tunnels, it discards them and quickly falls back to creating a fresh tunnel instead of spending the full request timeout probing many dead entries
 - when TLS is enabled, the tunnel transport is wrapped by Rama rustls before the private tunnel handshake starts
 
 This is not a full multi-stream multiplexing transport yet. It is intentionally simpler so the TCP/UDP proxy path stays easier to reason about and debug.

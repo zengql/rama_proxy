@@ -35,6 +35,8 @@ pub struct TunnelServerConfig {
 pub struct TunnelAuthConfig {
     #[serde(default = "default_shared_secret")]
     pub shared_secret: String,
+    #[serde(default)]
+    pub require_client_id: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct TunnelClientConfig {
     pub server_addr: String,
     #[serde(default = "default_shared_secret")]
     pub shared_secret: String,
+    #[serde(default)]
+    pub client_id: String,
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
     #[serde(default = "default_connect_timeout_secs")]
@@ -159,6 +163,7 @@ impl Default for TunnelAuthConfig {
     fn default() -> Self {
         Self {
             shared_secret: default_shared_secret(),
+            require_client_id: false,
         }
     }
 }
@@ -206,6 +211,7 @@ impl Default for TunnelClientConfig {
         Self {
             server_addr: default_server_addr(),
             shared_secret: default_shared_secret(),
+            client_id: String::new(),
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout_secs(),
         }
@@ -251,7 +257,9 @@ impl Default for LogConfig {
 impl ServerConfigFile {
     pub fn from_path(path: &Path) -> Result<Self, AppError> {
         let content = fs::read_to_string(path)?;
-        Ok(toml::from_str::<Self>(&content)?)
+        let mut config = toml::from_str::<Self>(&content)?;
+        config.resolve_relative_paths(path);
+        Ok(config)
     }
 
     pub fn write_default_to_path(path: &Path, force: bool) -> Result<(), AppError> {
@@ -269,12 +277,23 @@ impl ServerConfigFile {
         validate_server_tls_config(&self.tls)?;
         Ok(())
     }
+
+    fn resolve_relative_paths(&mut self, path: &Path) {
+        let Some(base_dir) = path.parent() else {
+            return;
+        };
+        resolve_file_path_in_place(&mut self.tls.cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.key_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_ca_cert_path, base_dir);
+    }
 }
 
 impl ClientConfigFile {
     pub fn from_path(path: &Path) -> Result<Self, AppError> {
         let content = fs::read_to_string(path)?;
-        Ok(toml::from_str::<Self>(&content)?)
+        let mut config = toml::from_str::<Self>(&content)?;
+        config.resolve_relative_paths(path);
+        Ok(config)
     }
 
     pub fn write_default_to_path(path: &Path, force: bool) -> Result<(), AppError> {
@@ -289,6 +308,11 @@ impl ClientConfigFile {
         if self.client.shared_secret.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "client.shared_secret must not be empty".to_string(),
+            ));
+        }
+        if self.client.client_id.contains('\n') || self.client.client_id.contains('\r') {
+            return Err(AppError::InvalidConfig(
+                "client.client_id must be a single-line string".to_string(),
             ));
         }
         if self.client.pool_size == 0 {
@@ -308,6 +332,15 @@ impl ClientConfigFile {
         }
         validate_client_tls_config(&self.tls)?;
         Ok(())
+    }
+
+    fn resolve_relative_paths(&mut self, path: &Path) {
+        let Some(base_dir) = path.parent() else {
+            return;
+        };
+        resolve_file_path_in_place(&mut self.tls.ca_cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_cert_path, base_dir);
+        resolve_file_path_in_place(&mut self.tls.client_key_path, base_dir);
     }
 }
 
@@ -402,6 +435,34 @@ fn require_existing_file(value: &str, field: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn resolve_file_path_in_place(value: &mut String, base_dir: &Path) {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return;
+    }
+
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return;
+    }
+
+    let config_relative = base_dir.join(path);
+    if config_relative.is_file() {
+        *value = config_relative.to_string_lossy().into_owned();
+        return;
+    }
+
+    if let Some(runtime_root) = base_dir.parent() {
+        let root_relative = runtime_root.join(path);
+        if root_relative.is_file() {
+            *value = root_relative.to_string_lossy().into_owned();
+            return;
+        }
+    }
+
+    *value = config_relative.to_string_lossy().into_owned();
+}
+
 fn write_default_template(path: &Path, force: bool, content: String) -> Result<(), AppError> {
     if path.exists() && !force {
         return Err(AppError::ConfigAlreadyExists(path.display().to_string()));
@@ -476,6 +537,7 @@ workers = 0
 
 [auth]
 shared_secret = "change-me"
+require_client_id = false
 
 [tls]
 enabled = false
@@ -497,6 +559,7 @@ fn default_client_template() -> String {
 [client]
 server_addr = "127.0.0.1:19090"
 shared_secret = "change-me"
+client_id = ""
 pool_size = 8
 connect_timeout_secs = 10
 
