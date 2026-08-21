@@ -2,6 +2,7 @@ mod cli;
 mod client_runtime;
 mod config;
 mod error;
+mod http_connect_runtime;
 mod logging;
 mod server_runtime;
 mod server_stats;
@@ -11,10 +12,13 @@ mod ui;
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 
 use clap::Parser;
 
-use crate::cli::{Cli, ClientCommand, Command, ModeAction, ServerCommand, UiCommand};
+use crate::cli::{
+    Cli, ClientCommand, Command, HttpConnectProxyCommand, ModeAction, ServerCommand, UiCommand,
+};
 use crate::config::{ClientConfigFile, ServerConfigFile};
 use crate::error::AppError;
 
@@ -25,6 +29,7 @@ async fn main() -> Result<(), AppError> {
     match cli.command {
         Command::Server(cmd) => handle_server(cmd).await,
         Command::Client(cmd) => handle_client(cmd).await,
+        Command::HttpConnectProxy(cmd) => handle_http_connect_proxy(cmd).await,
         Command::Ui(cmd) => handle_ui(cmd).await,
         Command::Version => {
             println!(
@@ -111,9 +116,17 @@ async fn handle_client(cmd: ClientCommand) -> Result<(), AppError> {
             let config = ClientConfigFile::from_path(&cmd.config)?;
             config.validate()?;
             logging::init(&config.log.level)?;
+            let _http_connect_proxy_child = spawn_http_connect_proxy_child(&config, &cmd.config)?;
             client_runtime::run(config).await
         }
     }
+}
+
+async fn handle_http_connect_proxy(cmd: HttpConnectProxyCommand) -> Result<(), AppError> {
+    let config = ClientConfigFile::from_path(&cmd.config)?;
+    config.validate()?;
+    logging::init(&config.log.level)?;
+    http_connect_runtime::run(config).await
 }
 
 async fn handle_ui(cmd: UiCommand) -> Result<(), AppError> {
@@ -173,4 +186,34 @@ fn spawn_daemon(mode: &str, config_path: &Path, extra_args: &[OsString]) -> Resu
         pid_path.display()
     );
     Ok(())
+}
+
+fn spawn_http_connect_proxy_child(
+    config: &ClientConfigFile,
+    config_path: &Path,
+) -> Result<Option<Child>, AppError> {
+    let Some(http_port) = config.http_connect.port else {
+        return Ok(None);
+    };
+
+    let exe = std::env::current_exe()?;
+    let child = ProcessCommand::new(exe)
+        .arg("http-connect-proxy")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    println!(
+        "http connect proxy started: pid={}, bind={}:{}, upstream_socks5={}:{}",
+        child.id(),
+        config.http_connect.bind,
+        http_port,
+        config.socks5.bind,
+        config.socks5.port
+    );
+
+    Ok(Some(child))
 }

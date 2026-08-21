@@ -27,6 +27,7 @@ const OP_PONG: u8 = 0x13;
 const OP_RESPONSE: u8 = 0x20;
 const OP_UDP_PACKET: u8 = 0x30;
 const OP_CLOSE: u8 = 0x31;
+const MAX_UDP_PAYLOAD: usize = 65535;
 
 const STATUS_OK: u8 = 0x00;
 const STATUS_AUTH_FAILED: u8 = 0x01;
@@ -128,9 +129,10 @@ impl TunnelPool {
             let idle = self.idle_len();
             let inspecting_idle = self.inspecting_idle.load(Ordering::Relaxed);
             let connecting = self.connecting.load(Ordering::Relaxed);
-            let missing = self
-                .warm_idle_target
-                .saturating_sub(idle.saturating_add(inspecting_idle).saturating_add(connecting));
+            let missing = self.warm_idle_target.saturating_sub(
+                idle.saturating_add(inspecting_idle)
+                    .saturating_add(connecting),
+            );
             if missing == 0 {
                 return;
             }
@@ -145,7 +147,8 @@ impl TunnelPool {
                             connecting,
                             active = self.active.load(Ordering::Relaxed),
                             consecutive_failures = refill_state.consecutive_failures,
-                            cooldown_secs = next_allowed_at.saturating_duration_since(now).as_secs(),
+                            cooldown_secs =
+                                next_allowed_at.saturating_duration_since(now).as_secs(),
                             "warm tunnel pool is backing off after refill failures"
                         );
                         refill_state.cooldown_logged_for = Some(next_allowed_at);
@@ -193,9 +196,14 @@ impl TunnelPool {
             .map(|tls| tls.client_auth_configured)
             .unwrap_or(false);
         tokio::spawn(async move {
-            let result =
-                connect_idle_tunnel(server_addr, &shared_secret, &client_id, connect_timeout, tls)
-                    .await;
+            let result = connect_idle_tunnel(
+                server_addr,
+                &shared_secret,
+                &client_id,
+                connect_timeout,
+                tls,
+            )
+            .await;
             match result {
                 Ok(stream) => {
                     reset_refill_backoff(&refill_state).await;
@@ -664,6 +672,11 @@ where
 {
     let target = read_host(reader).await?;
     let len = reader.read_u32().await? as usize;
+    if len > MAX_UDP_PAYLOAD {
+        return Err(AppError::InvalidConfig(format!(
+            "udp payload is too large: {len} bytes, maximum is {MAX_UDP_PAYLOAD}"
+        )));
+    }
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok((target, payload))

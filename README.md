@@ -2,6 +2,35 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Release 1.2.1
+
+This release hardens the server against slow or malformed tunnel clients and
+adds the protection counters to the built-in UI.
+
+Server-side changes:
+
+- TLS accept and the private tunnel handshake time out after 10 seconds by default.
+- At most 1024 tunnel handshakes run concurrently by default; rejected handshakes are logged and counted.
+- UDP tunnel payloads are limited to 65535 bytes before allocation.
+- UDP tunnels close after 300 seconds without traffic or heartbeat activity by default.
+- The stats Unix socket has a 5-second timeout for connect, request write, request read, and response read/write.
+- The server records current total, handshake, TCP, and UDP connections, plus cumulative handshake timeouts, handshake rejections, and EMFILE events.
+- The UI displays the connection and protection counters in a separate server protection section.
+
+The new server settings are configurable in `[server]`:
+
+```toml
+handshake_timeout_secs = 10
+max_handshakes = 1024
+udp_idle_timeout_secs = 300
+```
+
+Existing server configuration files remain compatible. Missing settings use the
+defaults above. Rama remains on the vendored `0.3.0-alpha.4` API in this
+release. Rama `0.4.0` was evaluated separately and is not included because it
+contains breaking API changes across the TLS, connector, proxy-layer, and I/O
+forwarding APIs used by this project.
+
 The current target is:
 
 - `client` runs locally and exposes SOCKS5 TCP/UDP to Clash
@@ -13,13 +42,14 @@ The current target is:
 
 - SOCKS5 `CONNECT`
 - SOCKS5 `UDP ASSOCIATE`
+- optional local HTTP proxy adapter over the local SOCKS5 endpoint
 - long-lived client/server tunnel pool
 - local SOCKS5 endpoint for Clash Party
 - remote outbound TCP/UDP access
 
 Out of scope:
 
-- HTTP / HTTPS CONNECT proxy
+- HTTPS proxy listener (`https://proxy-host:port`)
 - browser-specific logic
 - complex routing logic inside `rama-proxy` itself
 
@@ -144,6 +174,9 @@ bind = "0.0.0.0"
 port = 19090
 outbound_ip_mode = "ipv4"
 workers = 0
+handshake_timeout_secs = 10
+max_handshakes = 1024
+udp_idle_timeout_secs = 300
 
 [auth]
 shared_secret = "change-me"
@@ -185,6 +218,10 @@ connect_timeout_secs = 10
 bind = "127.0.0.1"
 port = 1080
 
+[http_connect]
+bind = "127.0.0.1"
+port = 18080
+
 [udp]
 enabled = true
 idle_timeout_secs = 60
@@ -213,11 +250,57 @@ Notes:
 - idle tunnel connections are health-checked in the background; stale connections are discarded and replenished immediately
 - `tls.client_cert_path` and `tls.client_key_path` are optional; when both are empty the client only verifies the server certificate and does not perform mutual TLS
 - `socks5.bind` and `socks5.port` define the local endpoint for Clash Party
+- configuring `http_connect.port` starts a local child process that accepts HTTP proxy requests and forwards through the local SOCKS5 listener
+- the adapter supports HTTP `CONNECT` plus plain `http://...` forward-proxy requests over HTTP/1.x
 - `udp.enabled` enables local SOCKS5 `UDP ASSOCIATE`
 - `auth` controls local SOCKS5 authentication between Clash Party and the local client
 - `tls.server_name` and `tls.ca_cert_path` are required when `tls.enabled = true`
 - `tls.client_cert_path` and `tls.client_key_path` are optional and used only when the server requires client auth
 - `tls.insecure_skip_verify` is reserved and currently rejected by config validation
+
+## HTTP Proxy Usage
+
+Use this mode when an app or browser does not support SOCKS5 but does support an HTTP proxy.
+
+Example client config:
+
+```toml
+[socks5]
+bind = "127.0.0.1"
+port = 1080
+
+[http_connect]
+bind = "127.0.0.1"
+port = 18080
+```
+
+Behavior:
+
+- starting `rama-proxy client --config config/client.toml` also starts a local HTTP proxy child process when `http_connect.port` is configured
+- if `http_connect.port` is omitted, the HTTP proxy adapter is not started
+- the HTTP child process does not connect to the remote server directly
+- it forwards accepted `CONNECT host:port` requests plus plain HTTP proxy requests such as `GET http://example.com/path HTTP/1.1` through the local SOCKS5 listener defined by `[socks5]`
+- if `[socks5].bind` uses a wildcard listener such as `0.0.0.0` or `::`, the HTTP child process automatically connects to the loopback form (`127.0.0.1` or `::1`) instead of the wildcard address
+- this keeps the existing tunnel, TLS, auth, and pool behavior in the original client/server path
+
+Point the app to:
+
+- proxy type: `HTTP`
+- proxy host: `127.0.0.1`
+- proxy port: `18080`
+
+Current limitation:
+
+- HTTPS target traffic works through the tunnel after `CONNECT` succeeds
+- plain HTTP proxy requests are forwarded as one upstream request per connection with `Connection: close`
+- request bodies using `Transfer-Encoding` are not supported yet
+- HTTP request pipelining is not supported
+
+If you need to run the adapter separately for debugging, the internal command is:
+
+```powershell
+rama-proxy http-connect-proxy --config config/client.toml
+```
 
 ## TLS Overview
 
@@ -421,8 +504,9 @@ proxies:
 3. Initialize and edit `config/client.toml` on the local host.
 4. Set `client.server_addr` and `auth.shared_secret`.
 5. If needed, generate certificates and enable `[tls]` on both sides.
-6. Start `rama-proxy client`.
-7. Point Clash Party to the local SOCKS5 endpoint.
+6. If needed, enable `[http_connect]` and choose a local HTTP proxy port.
+7. Start `rama-proxy client`.
+8. Point Clash Party to the local SOCKS5 endpoint, or point an HTTP-proxy-only app to the local `[http_connect]` endpoint.
 
 ## Current Behavior
 

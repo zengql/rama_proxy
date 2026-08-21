@@ -19,6 +19,9 @@ pub enum Command {
     Server(ServerCommand),
     /// Run or manage the local Clash-facing client.
     Client(ClientCommand),
+    /// Run the internal HTTP CONNECT adapter.
+    #[command(hide = true)]
+    HttpConnectProxy(HttpConnectProxyCommand),
     /// Run the built-in web UI for observing a server process.
     Ui(UiCommand),
     /// Print version information.
@@ -48,6 +51,12 @@ pub struct ClientCommand {
     /// Detach and run as a background daemon process.
     #[arg(long, default_value_t = false)]
     pub daemon: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HttpConnectProxyCommand {
+    #[arg(short = 'c', long, default_value = "config/client.toml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Args)]

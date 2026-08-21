@@ -19,9 +19,9 @@ use crate::{
     error::AppError,
     tls::build_client_tls_context,
     tunnel::{
-        TunnelPool, opcode_is_close, opcode_is_pong, opcode_is_udp_packet, read_opcode,
-        read_response, read_udp_packet, write_close, write_open_connect, write_open_udp,
-        write_ping, write_udp_packet,
+        TunnelPool, opcode_is_close, opcode_is_ping, opcode_is_pong, opcode_is_udp_packet,
+        read_opcode, read_response, read_udp_packet, write_close, write_open_connect,
+        write_open_udp, write_ping, write_pong, write_udp_packet,
     },
 };
 
@@ -78,10 +78,13 @@ async fn handle_client(
     stream.set_nodelay(true)?;
     info!(client = %peer, "accepted local socks5 session");
 
-    let header = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, client::Header::read_from(&mut stream))
-        .await
-        .map_err(|_| AppError::Boxed(format!("read socks5 header timed out for {peer}")))?
-        .map_err(|err| AppError::Boxed(format!("read socks5 header failed: {err}")))?;
+    let header = tokio::time::timeout(
+        SOCKS_HANDSHAKE_TIMEOUT,
+        client::Header::read_from(&mut stream),
+    )
+    .await
+    .map_err(|_| AppError::Boxed(format!("read socks5 header timed out for {peer}")))?
+    .map_err(|err| AppError::Boxed(format!("read socks5 header failed: {err}")))?;
 
     let method = negotiate_method(&header, config)?;
     server::Header::new(method).write_to(&mut stream).await?;
@@ -95,13 +98,18 @@ async fn handle_client(
     if method == SocksMethod::UsernamePassword {
         tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, authorize_user(&mut stream, config))
             .await
-            .map_err(|_| AppError::Boxed(format!("authorize socks5 user timed out for {peer}")))??;
+            .map_err(|_| {
+                AppError::Boxed(format!("authorize socks5 user timed out for {peer}"))
+            })??;
     }
 
-    let request = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, client::Request::read_from(&mut stream))
-        .await
-        .map_err(|_| AppError::Boxed(format!("read socks5 request timed out for {peer}")))?
-        .map_err(|err| AppError::Boxed(format!("read socks5 request failed: {err}")))?;
+    let request = tokio::time::timeout(
+        SOCKS_HANDSHAKE_TIMEOUT,
+        client::Request::read_from(&mut stream),
+    )
+    .await
+    .map_err(|_| AppError::Boxed(format!("read socks5 request timed out for {peer}")))?
+    .map_err(|err| AppError::Boxed(format!("read socks5 request failed: {err}")))?;
     info!(client = %peer, command = ?request.command, destination = %request.destination, "received socks5 request");
 
     match request.command {
@@ -195,9 +203,11 @@ async fn serve_connect(
     write_open_connect(&mut tunnel, &destination).await?;
     if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
         .await
-        .map_err(|_| AppError::Boxed(format!(
-            "wait tunnel open response timed out for {peer} -> {destination}"
-        )))?
+        .map_err(|_| {
+            AppError::Boxed(format!(
+                "wait tunnel open response timed out for {peer} -> {destination}"
+            ))
+        })?
     {
         warn!(client = %peer, destination = %destination, error = %err, "tunnel open connect failed");
         server::Reply::error_reply(ReplyKind::GeneralServerFailure)
@@ -299,6 +309,9 @@ async fn serve_udp_associate(
                 } else if opcode_is_close(opcode) {
                     info!(client = %peer, "udp tunnel closed by server");
                     return Ok(());
+                } else if opcode_is_ping(opcode) {
+                    write_pong(&mut tunnel).await?;
+                    last_activity = Instant::now();
                 } else if opcode_is_pong(opcode) {
                     last_activity = Instant::now();
                 } else {

@@ -14,6 +14,7 @@ use tokio::{
     io::copy_bidirectional,
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, error, info, warn};
 
@@ -23,13 +24,16 @@ use crate::{
     server_stats::{ServerStatsRegistry, spawn_stats_server},
     tls::{ServerTlsAcceptor, build_server_tls_acceptor},
     tunnel::{
-        opcode_is_close, opcode_is_connect, opcode_is_ping, opcode_is_udp, opcode_is_udp_packet,
-        read_connect_target, read_opcode, read_udp_packet, server_handshake, status_connect_failed,
-        status_resolve_failed, write_pong, write_response, write_udp_packet,
+        opcode_is_close, opcode_is_connect, opcode_is_ping, opcode_is_pong, opcode_is_udp,
+        opcode_is_udp_packet, read_connect_target, read_opcode, read_udp_packet, server_handshake,
+        status_connect_failed, status_resolve_failed, write_close, write_ping, write_pong,
+        write_response, write_udp_packet,
     },
 };
 
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const UDP_SELECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), AppError> {
     let bind_ip = parse_bind_ip(&config.server.bind)?;
@@ -37,23 +41,43 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
     let listener = bind_listener(listen_addr).await?;
     let tls_acceptor = build_server_tls_acceptor(&config.tls)?;
     let stats = ServerStatsRegistry::new();
+    let handshake_limiter = std::sync::Arc::new(Semaphore::new(config.server.max_handshakes));
     spawn_stats_server(stats.clone(), stats_socket.clone());
 
     info!(
         bind = %listen_addr,
         outbound_ip_mode = %config.server.outbound_ip_mode,
         tls_enabled = config.tls.enabled,
+        handshake_timeout_secs = config.server.handshake_timeout_secs,
+        max_handshakes = config.server.max_handshakes,
+        udp_idle_timeout_secs = config.server.udp_idle_timeout_secs,
         stats_socket = %stats_socket.display(),
         "tunnel server started"
     );
 
     loop {
-        let (stream, peer) = accept_with_retry(&listener).await?;
+        let (stream, peer) = accept_with_retry(&listener, &stats).await?;
         let config = config.clone();
         let tls_acceptor = tls_acceptor.clone();
         let stats = stats.clone();
+        let handshake_limiter = handshake_limiter.clone();
+        let handshake_permit = match handshake_limiter.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                stats.record_handshake_rejection();
+                warn!(
+                    client = %peer,
+                    max_handshakes = config.server.max_handshakes,
+                    "rejecting tunnel connection because handshake limit is reached"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer, config, tls_acceptor, stats).await {
+            if let Err(err) =
+                handle_connection(stream, peer, config, tls_acceptor, stats, handshake_permit).await
+            {
                 warn!(client = %peer, error = %err, "tunnel connection ended with error");
             }
         });
@@ -70,11 +94,17 @@ async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, AppError> {
     Ok(socket.listen(4096)?)
 }
 
-async fn accept_with_retry(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), AppError> {
+async fn accept_with_retry(
+    listener: &TcpListener,
+    stats: &ServerStatsRegistry,
+) -> Result<(TcpStream, SocketAddr), AppError> {
     loop {
         match listener.accept().await {
             Ok(conn) => return Ok(conn),
             Err(err) if is_retryable_accept_error(&err) => {
+                if matches!(err.raw_os_error(), Some(24) | Some(10024)) {
+                    stats.record_emfile();
+                }
                 warn!(
                     error = %err,
                     raw_os_error = err.raw_os_error(),
@@ -103,21 +133,46 @@ async fn handle_connection(
     config: ServerConfigFile,
     tls_acceptor: Option<ServerTlsAcceptor>,
     stats: ServerStatsRegistry,
+    handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
     let connection_id = stats.register_connection(peer.to_string()).await;
 
     let result = match tls_acceptor {
         Some(acceptor) => {
-            let mut stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
-            handle_connection_io(&mut stream, peer, config, &stats, connection_id).await
+            let mut stream = acceptor.accept(stream);
+            let mut stream = tokio::time::timeout(
+                std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),
+                &mut stream,
+            )
+            .await
+            .map_err(|_| {
+                stats.record_handshake_timeout();
+                warn!(client = %peer, "tls handshake timed out");
+                AppError::Boxed("tls handshake timed out".to_string())
+            })?
+            .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
+            handle_connection_io(
+                &mut stream,
+                peer,
+                config,
+                &stats,
+                connection_id,
+                handshake_permit,
+            )
+            .await
         }
         None => {
             let mut stream = stream;
-            handle_connection_io(&mut stream, peer, config, &stats, connection_id).await
+            handle_connection_io(
+                &mut stream,
+                peer,
+                config,
+                &stats,
+                connection_id,
+                handshake_permit,
+            )
+            .await
         }
     };
     stats.remove_connection(connection_id).await;
@@ -130,20 +185,31 @@ async fn handle_connection_io<S>(
     config: ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
+    handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let client_id = server_handshake(
+    let handshake = server_handshake(
         stream,
         &config.auth.shared_secret,
         config.auth.require_client_id,
+    );
+    let client_id = tokio::time::timeout(
+        std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),
+        handshake,
     )
     .await
+    .map_err(|_| {
+        stats.record_handshake_timeout();
+        warn!(client = %peer, "tunnel handshake timed out");
+        AppError::Boxed("tunnel handshake timed out".to_string())
+    })?
     .map_err(|err| {
         warn!(client = %peer, error = %err, "tunnel handshake failed");
         err
     })?;
+    drop(handshake_permit);
     stats.set_client_id(connection_id, client_id.clone()).await;
     stats.mark_idle(connection_id).await;
     debug!(client = %peer, client_id = %client_id, "tunnel client authenticated");
@@ -185,13 +251,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let extensions = build_outbound_extensions(&config.server.outbound_ip_mode)?;
-    let connect_result =
-        tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, default_tcp_connect(&extensions, target.clone()))
-            .await;
+    let connect_result = tokio::time::timeout(
+        OUTBOUND_CONNECT_TIMEOUT,
+        default_tcp_connect(&extensions, target.clone()),
+    )
+    .await;
     match connect_result {
         Ok(Ok((mut upstream, _addr))) => {
             if let Ok(addr) = upstream.peer_addr() {
-                stats.set_upstream_addr(connection_id, addr.to_string()).await;
+                stats
+                    .set_upstream_addr(connection_id, addr.to_string())
+                    .await;
             }
             write_response(tunnel, 0, "ok").await?;
             let result = copy_bidirectional(tunnel, &mut upstream).await;
@@ -221,7 +291,10 @@ where
             )))
         }
         Err(_) => {
-            let message = format!("connect target {target} timed out after {}s", OUTBOUND_CONNECT_TIMEOUT.as_secs());
+            let message = format!(
+                "connect target {target} timed out after {}s",
+                OUTBOUND_CONNECT_TIMEOUT.as_secs()
+            );
             warn!(client = %peer, target = %target, timeout_secs = OUTBOUND_CONNECT_TIMEOUT.as_secs(), "outbound tcp connect timed out");
             let (status, response_message) = status_connect_failed(&message);
             write_response(tunnel, status, &response_message).await?;
@@ -245,12 +318,40 @@ where
     write_response(tunnel, 0, "ok").await?;
 
     let mut recv_buf = vec![0u8; 65535];
+    let idle_timeout = std::time::Duration::from_secs(config.server.udp_idle_timeout_secs.max(5));
+    let mut last_activity = std::time::Instant::now();
     loop {
         tokio::select! {
             opcode = read_opcode(tunnel) => {
                 let opcode = opcode?;
                 if opcode_is_udp_packet(opcode) {
-                    let (target, payload) = read_udp_packet(tunnel).await?;
+                    if last_activity.elapsed() >= idle_timeout {
+                        warn!(
+                            client = %peer,
+                            idle_timeout_secs = idle_timeout.as_secs(),
+                            "udp frame read exceeded idle timeout"
+                        );
+                        let _ = write_close(tunnel).await;
+                        return Ok(());
+                    }
+                    let read_timeout = idle_timeout.saturating_sub(last_activity.elapsed());
+                    let (target, payload) = match tokio::time::timeout(
+                        read_timeout,
+                        read_udp_packet(tunnel),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            warn!(
+                                client = %peer,
+                                idle_timeout_secs = idle_timeout.as_secs(),
+                                "udp frame read timed out"
+                            );
+                            let _ = write_close(tunnel).await;
+                            return Ok(());
+                        }
+                    };
                     let remote = resolve_udp_target(&target, &config.server.outbound_ip_mode).await?;
                     stats
                         .add_udp_client_bytes(connection_id, target.to_string(), payload.len() as u64)
@@ -259,6 +360,14 @@ where
                         .set_upstream_addr(connection_id, remote.to_string())
                         .await;
                     udp.send_to(&payload, remote).await?;
+                    last_activity = std::time::Instant::now();
+                } else if opcode_is_ping(opcode) {
+                    stats.touch(connection_id).await;
+                    write_pong(tunnel).await?;
+                    last_activity = std::time::Instant::now();
+                } else if opcode_is_pong(opcode) {
+                    stats.touch(connection_id).await;
+                    last_activity = std::time::Instant::now();
                 } else if opcode_is_close(opcode) {
                     debug!(client = %peer, "udp tunnel closed by client");
                     return Ok(());
@@ -276,6 +385,21 @@ where
                     .add_udp_target_bytes(connection_id, remote.to_string(), n as u64)
                     .await;
                 write_udp_packet(tunnel, &source, &recv_buf[..n]).await?;
+                last_activity = std::time::Instant::now();
+            }
+            _ = tokio::time::sleep(UDP_SELECT_INTERVAL) => {
+                if last_activity.elapsed() >= idle_timeout {
+                    warn!(
+                        client = %peer,
+                        idle_timeout_secs = idle_timeout.as_secs(),
+                        "udp tunnel idle timeout reached"
+                    );
+                    let _ = write_close(tunnel).await;
+                    return Ok(());
+                }
+                if last_activity.elapsed() >= UDP_HEARTBEAT_INTERVAL {
+                    write_ping(tunnel).await?;
+                }
             }
         }
     }

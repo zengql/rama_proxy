@@ -29,6 +29,12 @@ pub struct TunnelServerConfig {
     pub outbound_ip_mode: String,
     #[serde(default)]
     pub workers: usize,
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    #[serde(default = "default_max_handshakes")]
+    pub max_handshakes: usize,
+    #[serde(default = "default_server_udp_idle_timeout_secs")]
+    pub udp_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +51,8 @@ pub struct ClientConfigFile {
     pub client: TunnelClientConfig,
     #[serde(default)]
     pub socks5: LocalSocks5Config,
+    #[serde(default)]
+    pub http_connect: LocalHttpConnectConfig,
     #[serde(default)]
     pub udp: LocalUdpConfig,
     #[serde(default)]
@@ -108,6 +116,14 @@ pub struct LocalSocks5Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalHttpConnectConfig {
+    #[serde(default = "default_local_bind")]
+    pub bind: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalUdpConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -155,6 +171,9 @@ impl Default for TunnelServerConfig {
             port: default_server_port(),
             outbound_ip_mode: default_outbound_ip_mode(),
             workers: 0,
+            handshake_timeout_secs: default_handshake_timeout_secs(),
+            max_handshakes: default_max_handshakes(),
+            udp_idle_timeout_secs: default_server_udp_idle_timeout_secs(),
         }
     }
 }
@@ -173,6 +192,7 @@ impl Default for ClientConfigFile {
         Self {
             client: TunnelClientConfig::default(),
             socks5: LocalSocks5Config::default(),
+            http_connect: LocalHttpConnectConfig::default(),
             udp: LocalUdpConfig::default(),
             auth: LocalAuthConfig::default(),
             tls: ClientTlsConfig::default(),
@@ -227,6 +247,15 @@ impl Default for LocalSocks5Config {
     }
 }
 
+impl Default for LocalHttpConnectConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_local_bind(),
+            port: None,
+        }
+    }
+}
+
 impl Default for LocalUdpConfig {
     fn default() -> Self {
         Self {
@@ -269,6 +298,11 @@ impl ServerConfigFile {
     pub fn validate(&self) -> Result<(), AppError> {
         validate_ip_bind(&self.server.bind, "server.bind")?;
         validate_outbound_ip_mode(&self.server.outbound_ip_mode)?;
+        if self.server.max_handshakes == 0 {
+            return Err(AppError::InvalidConfig(
+                "server.max_handshakes must be greater than 0".to_string(),
+            ));
+        }
         if self.auth.shared_secret.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "auth.shared_secret must not be empty".to_string(),
@@ -302,6 +336,7 @@ impl ClientConfigFile {
 
     pub fn validate(&self) -> Result<(), AppError> {
         validate_ip_bind(&self.socks5.bind, "socks5.bind")?;
+        validate_http_connect_config(&self.http_connect, &self.socks5)?;
         self.client.server_addr.parse::<SocketAddr>().map_err(|_| {
             AppError::InvalidConfig("client.server_addr must be host:port".to_string())
         })?;
@@ -510,6 +545,18 @@ fn default_connect_timeout_secs() -> u64 {
     10
 }
 
+fn default_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_max_handshakes() -> usize {
+    1024
+}
+
+fn default_server_udp_idle_timeout_secs() -> u64 {
+    300
+}
+
 fn default_idle_timeout() -> u64 {
     60
 }
@@ -534,6 +581,9 @@ bind = "0.0.0.0"
 port = 19090
 outbound_ip_mode = "ipv4"
 workers = 0
+handshake_timeout_secs = 10
+max_handshakes = 1024
+udp_idle_timeout_secs = 300
 
 [auth]
 shared_secret = "change-me"
@@ -567,6 +617,10 @@ connect_timeout_secs = 10
 bind = "127.0.0.1"
 port = 1080
 
+[http_connect]
+bind = "127.0.0.1"
+# port = 18080
+
 [udp]
 enabled = true
 idle_timeout_secs = 60
@@ -588,4 +642,31 @@ level = "info"
 format = "text"
 "#
     .to_string()
+}
+
+fn validate_http_connect_config(
+    http_connect: &LocalHttpConnectConfig,
+    socks5: &LocalSocks5Config,
+) -> Result<(), AppError> {
+    let Some(http_port) = http_connect.port else {
+        return Ok(());
+    };
+
+    validate_ip_bind(&http_connect.bind, "http_connect.bind")?;
+    if http_port == 0 {
+        return Err(AppError::InvalidConfig(
+            "http_connect.port must be greater than 0 when configured".to_string(),
+        ));
+    }
+
+    let http_bind = SocketAddr::new(IpAddr::from_str(&http_connect.bind).unwrap(), http_port);
+    let socks_bind = SocketAddr::new(IpAddr::from_str(&socks5.bind).unwrap(), socks5.port);
+    if http_bind == socks_bind {
+        return Err(AppError::InvalidConfig(
+            "http_connect listener must not reuse the same bind address and port as socks5"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }

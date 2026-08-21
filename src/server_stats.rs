@@ -6,6 +6,9 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+const STATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -19,6 +22,9 @@ use crate::error::AppError;
 pub struct ServerStatsRegistry {
     next_id: Arc<AtomicU64>,
     connections: Arc<RwLock<HashMap<u64, LiveConnection>>>,
+    handshake_timeouts: Arc<AtomicU64>,
+    handshake_rejections: Arc<AtomicU64>,
+    emfile_events: Arc<AtomicU64>,
 }
 
 impl ServerStatsRegistry {
@@ -26,6 +32,9 @@ impl ServerStatsRegistry {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
             connections: Arc::new(RwLock::new(HashMap::new())),
+            handshake_timeouts: Arc::new(AtomicU64::new(0)),
+            handshake_rejections: Arc::new(AtomicU64::new(0)),
+            emfile_events: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -135,6 +144,18 @@ impl ServerStatsRegistry {
         self.connections.write().await.remove(&id);
     }
 
+    pub fn record_handshake_timeout(&self) {
+        self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_handshake_rejection(&self) {
+        self.handshake_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_emfile(&self) {
+        self.emfile_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg_attr(not(unix), allow(dead_code))]
     pub async fn snapshot(&self) -> ServerStatsSnapshot {
         let now = now_unix_secs();
@@ -165,6 +186,9 @@ impl ServerStatsRegistry {
         ServerStatsSnapshot {
             generated_at_unix_secs: now,
             summary,
+            handshake_timeouts: self.handshake_timeouts.load(Ordering::Relaxed),
+            handshake_rejections: self.handshake_rejections.load(Ordering::Relaxed),
+            emfile_events: self.emfile_events.load(Ordering::Relaxed),
             connections: items
                 .into_iter()
                 .map(|item| ConnectionSnapshot {
@@ -201,6 +225,12 @@ impl ServerStatsRegistry {
 pub struct ServerStatsSnapshot {
     pub generated_at_unix_secs: u64,
     pub summary: ServerStatsSummary,
+    #[serde(default)]
+    pub handshake_timeouts: u64,
+    #[serde(default)]
+    pub handshake_rejections: u64,
+    #[serde(default)]
+    pub emfile_events: u64,
     pub connections: Vec<ConnectionSnapshot>,
 }
 
@@ -311,12 +341,31 @@ async fn run_stats_server(registry: ServerStatsRegistry, path: PathBuf) -> Resul
         let registry = registry.clone();
         tokio::spawn(async move {
             let mut req = [0u8; 64];
-            let _ = stream.read(&mut req).await;
+            let request = tokio::time::timeout(STATS_REQUEST_TIMEOUT, stream.read(&mut req)).await;
+            match request {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(error = %err, "stats socket request read failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!("stats socket request timed out");
+                    return;
+                }
+            }
             let snapshot = registry.snapshot().await;
             match serde_json::to_vec(&snapshot) {
                 Ok(body) => {
-                    let _ = stream.write_all(&body).await;
-                    let _ = stream.shutdown().await;
+                    match tokio::time::timeout(STATS_REQUEST_TIMEOUT, stream.write_all(&body)).await
+                    {
+                        Ok(Ok(())) => {
+                            let _ = stream.shutdown().await;
+                        }
+                        Ok(Err(err)) => {
+                            tracing::debug!(error = %err, "stats socket response write failed")
+                        }
+                        Err(_) => tracing::warn!("stats socket response write timed out"),
+                    }
                 }
                 Err(err) => {
                     let _ = stream
@@ -342,17 +391,18 @@ async fn query_snapshot_value(path: &Path) -> Result<serde_json::Value, AppError
 async fn query_snapshot_bytes(path: &Path) -> Result<Vec<u8>, AppError> {
     use tokio::net::UnixStream;
 
-    let mut stream = UnixStream::connect(path)
+    let mut stream = tokio::time::timeout(STATS_REQUEST_TIMEOUT, UnixStream::connect(path))
         .await
+        .map_err(|_| AppError::Boxed("connect stats socket timed out".to_string()))?
         .map_err(|err| AppError::Boxed(format!("connect stats socket failed: {err}")))?;
-    stream
-        .write_all(b"stats\n")
+    tokio::time::timeout(STATS_REQUEST_TIMEOUT, stream.write_all(b"stats\n"))
         .await
+        .map_err(|_| AppError::Boxed("write stats request timed out".to_string()))?
         .map_err(|err| AppError::Boxed(format!("write stats request failed: {err}")))?;
     let mut body = Vec::new();
-    stream
-        .read_to_end(&mut body)
+    tokio::time::timeout(STATS_REQUEST_TIMEOUT, stream.read_to_end(&mut body))
         .await
+        .map_err(|_| AppError::Boxed("read stats response timed out".to_string()))?
         .map_err(|err| AppError::Boxed(format!("read stats response failed: {err}")))?;
     Ok(body)
 }

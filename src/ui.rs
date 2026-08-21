@@ -1509,6 +1509,7 @@ fn index_html_v2() -> &'static str {
     .tag.fd { background: linear-gradient(135deg, #7a49f5, #5c6ff0); }
     .tag.socket { background: linear-gradient(135deg, #1098ad, #0f6fb8); }
     .tag.tunnel { background: linear-gradient(135deg, #f97316, #ef4444); }
+    .tag.guard { background: linear-gradient(135deg, #0f9d58, #34a853); }
     .toolbar, .tab-row, .filter-row {
       display: flex;
       gap: 10px;
@@ -1982,7 +1983,8 @@ fn index_html_v2() -> &'static str {
 
     function renderGlobalSections(snapshot) {
       const summary = snapshot.summary || {};
-      const tunnel = (snapshot.live_stats && snapshot.live_stats.summary) || {};
+      const liveStats = snapshot.live_stats || {};
+      const tunnel = liveStats.summary || {};
       const groups = [
         {
           tag: 'FD',
@@ -2012,12 +2014,23 @@ fn index_html_v2() -> &'static str {
           title: '通道',
           items: [
             ['总数', tunnel.total_connections ?? 0],
-            ['Handshake', tunnel.handshake_connections ?? 0],
             ['Idle', tunnel.idle_connections ?? 0],
             ['In Use', tunnel.in_use_connections ?? 0],
+            ['上下行', `${fmtBytes(tunnel.bytes_from_client ?? 0)} / ${fmtBytes(tunnel.bytes_from_target ?? 0)}`],
+          ],
+        },
+        {
+          tag: 'Guard',
+          tagClass: 'guard',
+          title: '服务端保护',
+          items: [
+            ['当前连接', tunnel.total_connections ?? 0],
+            ['Handshake', tunnel.handshake_connections ?? 0],
             ['Active TCP', tunnel.active_tcp_connections ?? 0],
             ['Active UDP', tunnel.active_udp_connections ?? 0],
-            ['上下行', `${fmtBytes(tunnel.bytes_from_client ?? 0)} / ${fmtBytes(tunnel.bytes_from_target ?? 0)}`],
+            ['握手超时累计', liveStats.handshake_timeouts ?? 0],
+            ['握手拒绝累计', liveStats.handshake_rejections ?? 0],
+            ['EMFILE 累计', liveStats.emfile_events ?? 0],
           ],
         },
       ];
