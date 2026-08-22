@@ -1837,7 +1837,7 @@ fn index_html_v2() -> &'static str {
         group.bytesFromClient += item.bytes_from_client || 0;
         group.bytesFromTarget += item.bytes_from_target || 0;
       }
-      if (!connections.length) {
+      if (!snapshot.live_stats) {
         for (const item of (snapshot.sockets || [])) {
           if (item.role !== 'client-srv') continue;
           const key = parseClientHost(item.remote_addr);

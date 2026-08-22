@@ -80,6 +80,8 @@ pub struct UiCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ModeAction {
+    /// Gracefully stop the background daemon.
+    Stop,
     /// Initialize a default TOML config file.
     Init {
         #[arg(short, long)]

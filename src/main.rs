@@ -45,6 +45,7 @@ async fn main() -> Result<(), AppError> {
 
 async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
     match cmd.action {
+        Some(ModeAction::Stop) => stop_daemon("server", &cmd.config),
         Some(ModeAction::Init { output, force }) => {
             let output = output.unwrap_or_else(|| cmd.config.clone());
             ServerConfigFile::write_default_to_path(&output, force)?;
@@ -86,6 +87,7 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
 
 async fn handle_client(cmd: ClientCommand) -> Result<(), AppError> {
     match cmd.action {
+        Some(ModeAction::Stop) => stop_daemon("client", &cmd.config),
         Some(ModeAction::Init { output, force }) => {
             let output = output.unwrap_or_else(|| cmd.config.clone());
             ClientConfigFile::write_default_to_path(&output, force)?;
@@ -185,6 +187,41 @@ fn spawn_daemon(mode: &str, config_path: &Path, extra_args: &[OsString]) -> Resu
         log_path.display(),
         pid_path.display()
     );
+    Ok(())
+}
+
+fn stop_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
+    let pid_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("rama-proxy-{mode}.pid"));
+    let raw_pid = std::fs::read_to_string(&pid_path).map_err(|err| {
+        AppError::Boxed(format!(
+            "read {mode} pid file {} failed: {err}",
+            pid_path.display()
+        ))
+    })?;
+    let pid = raw_pid
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| AppError::InvalidConfig(format!("invalid pid in {}", pid_path.display())))?;
+
+    #[cfg(windows)]
+    let status = ProcessCommand::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .status()?;
+    #[cfg(unix)]
+    let status = ProcessCommand::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+
+    if !status.success() {
+        return Err(AppError::Boxed(format!(
+            "failed to stop {mode} daemon pid {pid}"
+        )));
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    println!("stop requested: mode={mode}, pid={pid}");
     Ok(())
 }
 
