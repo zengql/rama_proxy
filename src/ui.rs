@@ -1106,6 +1106,10 @@ fn index_html() -> &'static str {
         },
         tunnel: {
           total: connections.length,
+          lastHeartbeat: connections
+            .filter((item) => item.state === 'heartbeat')
+            .map((item) => item.last_active_unix_secs)
+            .sort((a, b) => b - a)[0] || 0,
           handshake: connections.filter((item) => item.state === 'handshake').length,
           idle: connections.filter((item) => item.state === 'idle').length,
           inUse: connections.filter((item) => item.in_use).length,
@@ -1199,6 +1203,10 @@ fn index_html() -> &'static str {
       const items = selected
         ? [
             ['Client', selected.label],
+            ['上次心跳检测', fmtTs(selected.connections
+              .filter((item) => item.state === 'heartbeat')
+              .map((item) => item.last_active_unix_secs)
+              .sort((a, b) => b - a)[0] || 0)],
             ['Connections', selected.total],
             ['Idle', selected.idle],
             ['Active TCP', selected.activeTcp],

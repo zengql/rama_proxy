@@ -13,6 +13,7 @@ Server-side changes:
 - At most 1024 tunnel handshakes run concurrently by default; rejected handshakes are logged and counted.
 - UDP tunnel payloads are limited to 65535 bytes before allocation.
 - UDP tunnels close after 300 seconds without traffic or heartbeat activity by default.
+- Server tunnel sockets use TCP keepalive by default to detect half-open client connections without limiting long-lived tunnels.
 - The stats Unix socket has a 5-second timeout for connect, request write, request read, and response read/write.
 - The server records current total, handshake, TCP, and UDP connections, plus cumulative handshake timeouts, handshake rejections, and EMFILE events.
 - The UI displays the connection and protection counters in a separate server protection section.
@@ -23,6 +24,7 @@ The new server settings are configurable in `[server]`:
 handshake_timeout_secs = 10
 max_handshakes = 1024
 udp_idle_timeout_secs = 300
+tcp_keepalive_secs = 60
 ```
 
 Existing server configuration files remain compatible. Missing settings use the
@@ -250,6 +252,7 @@ Notes:
 - idle tunnel connections are health-checked in the background; stale connections are discarded and replenished immediately
 - `tls.client_cert_path` and `tls.client_key_path` are optional; when both are empty the client only verifies the server certificate and does not perform mutual TLS
 - `socks5.bind` and `socks5.port` define the local endpoint for Clash Party
+- `socks5.tcp_keepalive_secs` enables TCP keepalive on accepted local connections; it detects half-open mobile/VPN connections without limiting normal long-lived connections
 - configuring `http_connect.port` starts a local child process that accepts HTTP proxy requests and forwards through the local SOCKS5 listener
 - the adapter supports HTTP `CONNECT` plus plain `http://...` forward-proxy requests over HTTP/1.x
 - `udp.enabled` enables local SOCKS5 `UDP ASSOCIATE`

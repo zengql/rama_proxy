@@ -35,6 +35,12 @@ pub struct TunnelServerConfig {
     pub max_handshakes: usize,
     #[serde(default = "default_server_udp_idle_timeout_secs")]
     pub udp_idle_timeout_secs: u64,
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +111,10 @@ pub struct TunnelClientConfig {
     pub pool_size: usize,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +123,8 @@ pub struct LocalSocks5Config {
     pub bind: String,
     #[serde(default = "default_socks5_port")]
     pub port: u16,
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +186,9 @@ impl Default for TunnelServerConfig {
             handshake_timeout_secs: default_handshake_timeout_secs(),
             max_handshakes: default_max_handshakes(),
             udp_idle_timeout_secs: default_server_udp_idle_timeout_secs(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
         }
     }
 }
@@ -234,6 +249,8 @@ impl Default for TunnelClientConfig {
             client_id: String::new(),
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout_secs(),
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
         }
     }
 }
@@ -243,6 +260,7 @@ impl Default for LocalSocks5Config {
         Self {
             bind: default_local_bind(),
             port: default_socks5_port(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
         }
     }
 }
@@ -525,6 +543,18 @@ fn default_socks5_port() -> u16 {
     1080
 }
 
+fn default_tcp_keepalive_secs() -> u64 {
+    60
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    30
+}
+
+fn default_heartbeat_timeout_secs() -> u64 {
+    10
+}
+
 fn default_server_addr() -> String {
     format!("127.0.0.1:{}", default_server_port())
 }
@@ -584,6 +614,9 @@ workers = 0
 handshake_timeout_secs = 10
 max_handshakes = 1024
 udp_idle_timeout_secs = 300
+tcp_keepalive_secs = 60
+heartbeat_interval_secs = 30
+heartbeat_timeout_secs = 10
 
 [auth]
 shared_secret = "change-me"
@@ -612,10 +645,13 @@ shared_secret = "change-me"
 client_id = ""
 pool_size = 8
 connect_timeout_secs = 10
+heartbeat_interval_secs = 30
+heartbeat_timeout_secs = 10
 
 [socks5]
 bind = "127.0.0.1"
 port = 1080
+tcp_keepalive_secs = 60
 
 [http_connect]
 bind = "127.0.0.1"

@@ -24,6 +24,9 @@ const OP_CONNECT: u8 = 0x10;
 const OP_UDP_ASSOCIATE: u8 = 0x11;
 const OP_PING: u8 = 0x12;
 const OP_PONG: u8 = 0x13;
+const OP_HEARTBEAT: u8 = 0x14;
+const OP_HEARTBEAT_ACK: u8 = 0x15;
+const OP_HEARTBEAT_OPEN: u8 = 0x16;
 const OP_RESPONSE: u8 = 0x20;
 const OP_UDP_PACKET: u8 = 0x30;
 const OP_CLOSE: u8 = 0x31;
@@ -475,6 +478,24 @@ async fn connect_idle_tunnel(
     Ok(stream)
 }
 
+pub async fn run_heartbeat(
+    server_addr: SocketAddr,
+    shared_secret: &str,
+    client_id: &str,
+    connect_timeout: Duration,
+    tls: Option<ClientTlsContext>,
+) -> Result<(), AppError> {
+    let mut stream = connect_idle_tunnel(
+        server_addr, shared_secret, client_id, connect_timeout, tls,
+    )
+    .await?;
+    write_heartbeat_open(&mut stream).await?;
+    loop {
+        let (_, ids) = read_heartbeat(&mut stream).await?;
+        write_heartbeat_ack(&mut stream, &ids).await?;
+    }
+}
+
 pub async fn client_handshake<S>(
     stream: &mut S,
     shared_secret: &str,
@@ -549,7 +570,7 @@ where
     Ok(client_id)
 }
 
-fn resolve_client_id(configured: &str) -> String {
+pub fn resolve_client_id(configured: &str) -> String {
     let configured = configured.trim();
     if !configured.is_empty() {
         return configured.to_string();
@@ -646,6 +667,62 @@ where
     W: AsyncWrite + Unpin,
 {
     writer.write_u8(OP_PONG).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+pub async fn write_heartbeat<W>(writer: &mut W, ids: &[u64]) -> Result<(), AppError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(OP_HEARTBEAT).await?;
+    writer.write_u32(ids.len() as u32).await?;
+    for id in ids {
+        writer.write_u64(*id).await?;
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
+pub async fn write_heartbeat_open<W>(writer: &mut W) -> Result<(), AppError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(OP_HEARTBEAT_OPEN).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+pub async fn read_heartbeat<R>(reader: &mut R) -> Result<(u8, Vec<u64>), AppError>
+where
+    R: AsyncRead + Unpin,
+{
+    let opcode = reader.read_u8().await?;
+    if !opcode_is_heartbeat(opcode) && !opcode_is_heartbeat_ack(opcode) {
+        return Err(AppError::InvalidConfig(format!(
+            "unexpected heartbeat opcode: {opcode}"
+        )));
+    }
+    let count = reader.read_u32().await?;
+    if count > 65535 {
+        return Err(AppError::InvalidConfig("heartbeat channel batch is too large".to_string()));
+    }
+    let mut ids = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        ids.push(reader.read_u64().await?);
+    }
+    Ok((opcode, ids))
+}
+
+pub async fn write_heartbeat_ack<W>(writer: &mut W, ids: &[u64]) -> Result<(), AppError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(OP_HEARTBEAT_ACK).await?;
+    writer.write_u32(ids.len() as u32).await?;
+    for id in ids {
+        writer.write_u64(*id).await?;
+    }
     writer.flush().await?;
     Ok(())
 }
@@ -748,6 +825,18 @@ pub fn opcode_is_ping(opcode: u8) -> bool {
 
 pub fn opcode_is_pong(opcode: u8) -> bool {
     opcode == OP_PONG
+}
+
+pub fn opcode_is_heartbeat(opcode: u8) -> bool {
+    opcode == OP_HEARTBEAT
+}
+
+pub fn opcode_is_heartbeat_ack(opcode: u8) -> bool {
+    opcode == OP_HEARTBEAT_ACK
+}
+
+pub fn opcode_is_heartbeat_open(opcode: u8) -> bool {
+    opcode == OP_HEARTBEAT_OPEN
 }
 
 pub fn opcode_is_connect(opcode: u8) -> bool {

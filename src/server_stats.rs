@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +22,8 @@ use crate::error::AppError;
 pub struct ServerStatsRegistry {
     next_id: Arc<AtomicU64>,
     connections: Arc<RwLock<HashMap<u64, LiveConnection>>>,
+    heartbeat_by_client: Arc<RwLock<HashMap<String, u64>>>,
+    close_tx: broadcast::Sender<u64>,
     handshake_timeouts: Arc<AtomicU64>,
     handshake_rejections: Arc<AtomicU64>,
     emfile_events: Arc<AtomicU64>,
@@ -29,9 +31,12 @@ pub struct ServerStatsRegistry {
 
 impl ServerStatsRegistry {
     pub fn new() -> Self {
+        let (close_tx, _) = broadcast::channel(1024);
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
             connections: Arc::new(RwLock::new(HashMap::new())),
+            heartbeat_by_client: Arc::new(RwLock::new(HashMap::new())),
+            close_tx,
             handshake_timeouts: Arc::new(AtomicU64::new(0)),
             handshake_rejections: Arc::new(AtomicU64::new(0)),
             emfile_events: Arc::new(AtomicU64::new(0)),
@@ -142,6 +147,63 @@ impl ServerStatsRegistry {
 
     pub async fn remove_connection(&self, id: u64) {
         self.connections.write().await.remove(&id);
+        self.heartbeat_by_client
+            .write()
+            .await
+            .retain(|_, value| *value != id);
+    }
+
+    pub async fn register_heartbeat(&self, client_id: &str, id: u64) -> Option<u64> {
+        self.update(id, |entry| {
+            entry.state = "heartbeat".to_string();
+            entry.in_use = false;
+        }).await;
+        self.heartbeat_by_client.write().await.insert(client_id.to_string(), id)
+    }
+
+    pub fn close_connection(&self, id: u64) {
+        let _ = self.close_tx.send(id);
+    }
+
+    pub async fn close_client_connection_if_exists(&self, client_id: &str, id: u64) -> bool {
+        let belongs_to_client = self
+            .connections
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|entry| entry.client_id == client_id && entry.state != "heartbeat");
+        if !belongs_to_client {
+            return false;
+        }
+        self.close_connection(id);
+        true
+    }
+
+    pub fn subscribe_close(&self) -> broadcast::Receiver<u64> {
+        self.close_tx.subscribe()
+    }
+
+    pub async fn mark_heartbeat(&self, id: u64) {
+        self.update(id, |entry| {
+            entry.state = "heartbeat".to_string();
+            entry.in_use = false;
+            entry.last_active_unix_secs = now_unix_secs();
+        })
+        .await;
+    }
+
+    pub async fn client_tunnel_ids(&self, client_id: &str) -> Vec<u64> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|entry| {
+                entry.client_id == client_id
+                    && entry.state != "heartbeat"
+                    && now_unix_secs().saturating_sub(entry.accepted_at_unix_secs) >= 600
+            })
+            .map(|entry| entry.id)
+            .collect()
     }
 
     pub fn record_handshake_timeout(&self) {

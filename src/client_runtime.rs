@@ -9,7 +9,7 @@ use rama::{
     utils::str::NonEmptyStr,
 };
 use tokio::{
-    io::copy_bidirectional,
+    io::copy,
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
 };
 use tracing::{info, warn};
@@ -20,7 +20,8 @@ use crate::{
     tls::build_client_tls_context,
     tunnel::{
         TunnelPool, opcode_is_close, opcode_is_ping, opcode_is_pong, opcode_is_udp_packet,
-        read_opcode, read_response, read_udp_packet, write_close, write_open_connect,
+        resolve_client_id,
+        read_opcode, read_response, read_udp_packet, run_heartbeat, write_close, write_open_connect,
         write_open_udp, write_ping, write_pong, write_udp_packet,
     },
 };
@@ -37,6 +38,40 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
 
     let pool = TunnelPool::new(&config.client, tls)?;
     pool.spawn_maintainer();
+    let heartbeat_config = config.clone();
+    tokio::spawn(async move {
+        let server_addr = match heartbeat_config.client.server_addr.parse() {
+            Ok(addr) => addr,
+            Err(err) => {
+                warn!(error = %err, "heartbeat server address is invalid");
+                return;
+            }
+        };
+        loop {
+            let result = match build_client_tls_context(&heartbeat_config.tls) {
+                Ok(tls) => run_heartbeat(
+                    server_addr,
+                    &heartbeat_config.client.shared_secret,
+                    &resolve_client_id(&heartbeat_config.client.client_id),
+                    Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
+                    tls,
+                )
+                .await,
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        retry_secs = 10,
+                        "heartbeat channel unavailable; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
 
     info!(
         bind = %listen_addr,
@@ -49,6 +84,10 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        let socket = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(config.socks5.tcp_keepalive_secs.max(1)));
+        socket.set_tcp_keepalive(&keepalive)?;
         let config = config.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -221,7 +260,14 @@ async fn serve_connect(
         .write_to(&mut stream)
         .await?;
 
-    let result = copy_bidirectional(&mut stream, &mut tunnel).await;
+    let (mut local_reader, mut local_writer) = tokio::io::split(stream);
+    let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
+    let result = tokio::select! {
+        local_to_tunnel = copy(&mut local_reader, &mut tunnel_writer) =>
+            local_to_tunnel.map(|up_bytes| (up_bytes, 0)),
+        tunnel_to_local = copy(&mut tunnel_reader, &mut local_writer) =>
+            tunnel_to_local.map(|down_bytes| (0, down_bytes)),
+    };
     match result {
         Ok((up_bytes, down_bytes)) => {
             info!(

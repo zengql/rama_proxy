@@ -1670,6 +1670,7 @@ dependencies = [
  "rama",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tokio",
  "toml",

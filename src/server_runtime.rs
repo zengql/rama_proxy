@@ -11,10 +11,9 @@ use rama::{
     tcp::client::default_tcp_connect,
 };
 use tokio::{
-    io::copy_bidirectional,
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast},
 };
 use tracing::{debug, error, info, warn};
 
@@ -24,12 +23,15 @@ use crate::{
     server_stats::{ServerStatsRegistry, spawn_stats_server},
     tls::{ServerTlsAcceptor, build_server_tls_acceptor},
     tunnel::{
-        opcode_is_close, opcode_is_connect, opcode_is_ping, opcode_is_pong, opcode_is_udp,
-        opcode_is_udp_packet, read_connect_target, read_opcode, read_udp_packet, server_handshake,
-        status_connect_failed, status_resolve_failed, write_close, write_ping, write_pong,
-        write_response, write_udp_packet,
+        opcode_is_close, opcode_is_connect, opcode_is_heartbeat_open,
+        opcode_is_ping, opcode_is_pong,
+        opcode_is_udp, opcode_is_udp_packet, read_connect_target, read_opcode, read_udp_packet,
+        server_handshake, status_connect_failed, status_resolve_failed, write_close, write_ping,
+        read_heartbeat, write_heartbeat, write_pong, write_response, write_udp_packet,
     },
 };
+
+use std::time::Duration;
 
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -57,6 +59,15 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
 
     loop {
         let (stream, peer) = accept_with_retry(&listener, &stats).await?;
+        let socket = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(
+                config.server.tcp_keepalive_secs.max(1),
+            ))
+            .with_interval(std::time::Duration::from_secs(
+                config.server.tcp_keepalive_secs.max(1),
+            ));
+        socket.set_tcp_keepalive(&keepalive)?;
         let config = config.clone();
         let tls_acceptor = tls_acceptor.clone();
         let stats = stats.clone();
@@ -74,12 +85,12 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
                 continue;
             }
         };
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(stream, peer, config, tls_acceptor, stats, handshake_permit).await
-            {
-                warn!(client = %peer, error = %err, "tunnel connection ended with error");
-            }
+    tokio::spawn(async move {
+        if let Err(err) =
+            handle_connection(stream, peer, config, tls_acceptor, stats.clone(), handshake_permit).await
+        {
+            warn!(client = %peer, error = %err, "tunnel connection ended with error");
+        }
         });
     }
 }
@@ -137,6 +148,7 @@ async fn handle_connection(
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
     let connection_id = stats.register_connection(peer.to_string()).await;
+    let close_rx = stats.subscribe_close();
 
     let result = match tls_acceptor {
         Some(acceptor) => {
@@ -158,6 +170,7 @@ async fn handle_connection(
                 config,
                 &stats,
                 connection_id,
+                close_rx,
                 handshake_permit,
             )
             .await
@@ -170,6 +183,7 @@ async fn handle_connection(
                 config,
                 &stats,
                 connection_id,
+                close_rx,
                 handshake_permit,
             )
             .await
@@ -185,6 +199,7 @@ async fn handle_connection_io<S>(
     config: ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
+    mut close_rx: broadcast::Receiver<u64>,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError>
 where
@@ -215,7 +230,20 @@ where
     debug!(client = %peer, client_id = %client_id, "tunnel client authenticated");
 
     loop {
-        let opcode = read_opcode(stream).await?;
+        let opcode = tokio::select! {
+            result = read_opcode(stream) => result?,
+            recv = close_rx.recv() => {
+                if let Ok(id) = recv {
+                    if id == connection_id {
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+        };
+        if opcode_is_heartbeat_open(opcode) {
+            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id).await;
+        }
         if opcode_is_ping(opcode) {
             stats.touch(connection_id).await;
             write_pong(stream).await?;
@@ -226,16 +254,78 @@ where
             stats
                 .mark_active_tcp(connection_id, target.to_string())
                 .await;
-            return serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id).await;
+            return serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id, close_rx).await;
         }
         if opcode_is_udp(opcode) {
             stats.mark_active_udp(connection_id).await;
-            return serve_udp_tunnel(stream, peer, &config, stats, connection_id).await;
+            return serve_udp_tunnel(stream, peer, &config, stats, connection_id, close_rx).await;
         }
         error!(client = %peer, opcode, "received unknown tunnel opcode");
         return Err(AppError::InvalidConfig(format!(
             "unknown tunnel opcode from client {peer}: {opcode}"
         )));
+    }
+}
+
+async fn serve_heartbeat_control<S>(
+    stream: &mut S,
+    peer: SocketAddr,
+    client_id: String,
+    config: &ServerConfigFile,
+    stats: &ServerStatsRegistry,
+    connection_id: u64,
+) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if let Some(previous_id) = stats.register_heartbeat(&client_id, connection_id).await {
+        if previous_id != connection_id {
+            stats.close_connection(previous_id);
+        }
+    }
+    let interval = Duration::from_secs(config.server.heartbeat_interval_secs.max(1));
+    let timeout = Duration::from_secs(config.server.heartbeat_timeout_secs.max(1));
+    loop {
+        let ids = stats.client_tunnel_ids(&client_id).await;
+        write_heartbeat(stream, &ids).await?;
+        let (opcode, ack_ids) = tokio::time::timeout(timeout, read_heartbeat(stream))
+            .await
+            .map_err(|_| AppError::Boxed(format!("heartbeat ack timed out from {peer}")))??;
+        if !crate::tunnel::opcode_is_heartbeat_ack(opcode) {
+            return Err(AppError::InvalidConfig(format!(
+                "invalid heartbeat ack from {peer}"
+            )));
+        }
+        for id in ack_ids
+            .iter()
+            .filter(|id| **id != connection_id && !ids.contains(id))
+        {
+            debug!(
+                client = %peer,
+                channel_id = *id,
+                "heartbeat reported an invalid channel id; closing that channel"
+            );
+            if !stats
+                .close_client_connection_if_exists(&client_id, *id)
+                .await
+            {
+                debug!(
+                    client = %peer,
+                    channel_id = *id,
+                    "heartbeat reported a channel that was already closed; ignoring"
+                );
+            }
+        }
+        if ack_ids.len() != ids.len() {
+            debug!(
+                client = %peer,
+                expected_channels = ids.len(),
+                reported_channels = ack_ids.len(),
+                "heartbeat channel list differs from server snapshot"
+            );
+        }
+        stats.mark_heartbeat(connection_id).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -246,6 +336,7 @@ async fn serve_tcp_tunnel<S>(
     config: &ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
+    mut close_rx: broadcast::Receiver<u64>,
 ) -> Result<(), AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -257,14 +348,33 @@ where
     )
     .await;
     match connect_result {
-        Ok(Ok((mut upstream, _addr))) => {
+        Ok(Ok((upstream, _addr))) => {
             if let Ok(addr) = upstream.peer_addr() {
                 stats
                     .set_upstream_addr(connection_id, addr.to_string())
                     .await;
             }
             write_response(tunnel, 0, "ok").await?;
-            let result = copy_bidirectional(tunnel, &mut upstream).await;
+            let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
+            let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
+            let result = tokio::select! {
+                tunnel_to_upstream = tokio::io::copy(&mut tunnel_reader, &mut upstream_writer) => {
+                    let _ = upstream_writer.shutdown().await;
+                    let _ = tunnel_writer.shutdown().await;
+                    tunnel_to_upstream.map(|bytes| (bytes, 0))
+                }
+                upstream_to_tunnel = tokio::io::copy(&mut upstream_reader, &mut tunnel_writer) => {
+                    let _ = tunnel_writer.shutdown().await;
+                    let _ = upstream_writer.shutdown().await;
+                    upstream_to_tunnel.map(|bytes| (0, bytes))
+                }
+                recv = close_rx.recv() => {
+                    match recv {
+                        Ok(id) if id == connection_id => Ok((0, 0)),
+                        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "connection closed by server")),
+                    }
+                }
+            };
             match result {
                 Ok((up_bytes, down_bytes)) => {
                     stats
@@ -309,6 +419,7 @@ async fn serve_udp_tunnel<S>(
     config: &ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
+    mut close_rx: broadcast::Receiver<u64>,
 ) -> Result<(), AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -399,6 +510,14 @@ where
                 }
                 if last_activity.elapsed() >= UDP_HEARTBEAT_INTERVAL {
                     write_ping(tunnel).await?;
+                }
+            }
+            recv = close_rx.recv() => {
+                if let Ok(id) = recv {
+                    if id == connection_id {
+                        let _ = write_close(tunnel).await;
+                        return Ok(());
+                    }
                 }
             }
         }
