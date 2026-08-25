@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -19,7 +19,88 @@ use crate::server_stats::ServerStatsSnapshot;
 #[cfg(unix)]
 use crate::server_stats::query_snapshot as query_server_stats_snapshot;
 
-pub async fn run(cmd: UiCommand) -> Result<(), AppError> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_pid_file")]
+    pub pid_file: PathBuf,
+    #[serde(default = "default_ui_pid_file")]
+    pub ui_pid_file: PathBuf,
+    #[serde(default = "default_stats_socket")]
+    pub stats_socket: PathBuf,
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl UiConfig {
+    pub fn from_path(path: &Path) -> Result<Self, AppError> {
+        let content = fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
+    }
+
+    pub fn write_default_to_path(path: &Path, force: bool) -> Result<(), AppError> {
+        if path.exists() && !force {
+            return Err(AppError::InvalidConfig(format!(
+                "file already exists: {}",
+                path.display()
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(&Self::default())?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn with_overrides(self, cmd: UiCommand) -> Self {
+        Self {
+            bind: cmd.bind.unwrap_or(self.bind),
+            port: cmd.port.unwrap_or(self.port),
+            pid_file: cmd.pid_file.unwrap_or(self.pid_file),
+            ui_pid_file: cmd.ui_pid_file.unwrap_or(self.ui_pid_file),
+            stats_socket: cmd.stats_socket.unwrap_or(self.stats_socket),
+            interval_ms: cmd.interval_ms.unwrap_or(self.interval_ms),
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+            port: default_port(),
+            pid_file: default_pid_file(),
+            ui_pid_file: default_ui_pid_file(),
+            stats_socket: default_stats_socket(),
+            interval_ms: default_interval_ms(),
+        }
+    }
+}
+
+fn default_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    19091
+}
+fn default_pid_file() -> PathBuf {
+    PathBuf::from("config/rama-proxy-server.pid")
+}
+fn default_ui_pid_file() -> PathBuf {
+    PathBuf::from("config/rama-proxy-ui.pid")
+}
+fn default_stats_socket() -> PathBuf {
+    PathBuf::from("config/rama-proxy-server.stats.sock")
+}
+fn default_interval_ms() -> u64 {
+    2000
+}
+
+pub async fn run(cmd: UiConfig) -> Result<(), AppError> {
     if !cfg!(target_os = "linux") {
         return Err(AppError::InvalidConfig(
             "ui mode currently supports Linux /proc only".to_string(),
@@ -30,7 +111,14 @@ pub async fn run(cmd: UiCommand) -> Result<(), AppError> {
         .map_err(|_| AppError::InvalidConfig("ui --bind must be a valid IP address".to_string()))?;
     let listen_addr = SocketAddr::new(bind_ip, cmd.port);
     let pid_file = absolutize_path(&cmd.pid_file)?;
+    let ui_pid_file = absolutize_path(&cmd.ui_pid_file)?;
     let stats_socket = absolutize_path(&cmd.stats_socket)?;
+
+    if let Some(parent) = ui_pid_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&ui_pid_file, std::process::id().to_string())?;
+    let _pid_guard = UiPidGuard::new(ui_pid_file);
 
     let state = Arc::new(AppState {
         snapshot: RwLock::new(None),
@@ -59,6 +147,22 @@ pub async fn run(cmd: UiCommand) -> Result<(), AppError> {
     }
 }
 
+struct UiPidGuard {
+    path: PathBuf,
+}
+
+impl UiPidGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for UiPidGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 struct AppState {
     snapshot: RwLock<Option<UiSnapshot>>,
 }
@@ -69,6 +173,7 @@ struct Poller {
     interval: Duration,
     fd_seen: HashMap<u32, Instant>,
     socket_seen: HashMap<u64, Instant>,
+    last_live_stats: Option<ServerStatsSnapshot>,
 }
 
 impl Poller {
@@ -79,6 +184,7 @@ impl Poller {
             interval,
             fd_seen: HashMap::new(),
             socket_seen: HashMap::new(),
+            last_live_stats: None,
         }
     }
 
@@ -107,7 +213,13 @@ impl Poller {
         let socket_map = read_socket_table_map()?;
         let mut fd_entries = read_fd_entries(pid, &self.fd_seen, &socket_map)?;
         let listen_ports = detect_server_listen_ports(&fd_entries);
-        let live_stats = self.query_live_stats().await;
+        let live_stats = match self.query_live_stats().await {
+            Ok(stats) => {
+                self.last_live_stats = Some(stats.clone());
+                Ok(stats)
+            }
+            Err(err) => Err(err),
+        };
         let mut sockets = Vec::new();
         let mut summary = Summary::default();
 
@@ -161,7 +273,7 @@ impl Poller {
 
         let (live_stats, live_stats_error) = match live_stats {
             Ok(stats) => (Some(stats), None),
-            Err(err) => (None, Some(err.to_string())),
+            Err(err) => (self.last_live_stats.clone(), Some(err.to_string())),
         };
 
         Ok(UiSnapshot {

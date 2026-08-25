@@ -40,6 +40,7 @@ async fn main() -> Result<(), AppError> {
             );
             Ok(())
         }
+        Command::Stop => stop_all(),
     }
 }
 
@@ -132,8 +133,29 @@ async fn handle_http_connect_proxy(cmd: HttpConnectProxyCommand) -> Result<(), A
 }
 
 async fn handle_ui(cmd: UiCommand) -> Result<(), AppError> {
+    match cmd.action {
+        Some(cli::UiAction::Stop) => {
+            return stop_pid_file(
+                "ui",
+                cmd.ui_pid_file
+                    .as_deref()
+                    .unwrap_or(Path::new("config/rama-proxy-ui.pid")),
+            );
+        }
+        Some(cli::UiAction::Init { output, force }) => {
+            let path = output.unwrap_or(cmd.config);
+            ui::UiConfig::write_default_to_path(&path, force)?;
+            println!("initialized ui config: {}", path.display());
+            return Ok(());
+        }
+        None => {}
+    }
     logging::init("info")?;
-    ui::run(cmd).await
+    if cmd.daemon {
+        return spawn_daemon("ui", &cmd.config, &[]);
+    }
+    let config = ui::UiConfig::from_path(&cmd.config)?;
+    ui::run(config.with_overrides(cmd)).await
 }
 
 fn spawn_daemon(mode: &str, config_path: &Path, extra_args: &[OsString]) -> Result<(), AppError> {
@@ -195,7 +217,11 @@ fn stop_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
         .parent()
         .unwrap_or(Path::new("."))
         .join(format!("rama-proxy-{mode}.pid"));
-    let raw_pid = std::fs::read_to_string(&pid_path).map_err(|err| {
+    stop_pid_file(mode, &pid_path)
+}
+
+fn stop_pid_file(mode: &str, pid_path: &Path) -> Result<(), AppError> {
+    let raw_pid = std::fs::read_to_string(pid_path).map_err(|err| {
         AppError::Boxed(format!(
             "read {mode} pid file {} failed: {err}",
             pid_path.display()
@@ -220,8 +246,33 @@ fn stop_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
             "failed to stop {mode} daemon pid {pid}"
         )));
     }
-    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(pid_path);
     println!("stop requested: mode={mode}, pid={pid}");
+    Ok(())
+}
+
+fn stop_all() -> Result<(), AppError> {
+    let config_dir = Path::new("config");
+    let mut stopped = 0;
+    for (mode, pid_file) in [
+        ("server", config_dir.join("rama-proxy-server.pid")),
+        ("client", config_dir.join("rama-proxy-client.pid")),
+        ("ui", config_dir.join("rama-proxy-ui.pid")),
+    ] {
+        match stop_pid_file(mode, &pid_file) {
+            Ok(()) => stopped += 1,
+            Err(AppError::Boxed(message))
+                if message.starts_with("read ") && message.contains("pid file") =>
+            {
+                println!(
+                    "stop skipped: mode={mode}, pidfile={} not found",
+                    pid_file.display()
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    println!("stop completed: stopped={stopped}");
     Ok(())
 }
 

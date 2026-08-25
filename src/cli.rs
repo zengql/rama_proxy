@@ -26,6 +26,8 @@ pub enum Command {
     Ui(UiCommand),
     /// Print version information.
     Version,
+    /// Stop all background rama-proxy processes.
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -61,21 +63,44 @@ pub struct HttpConnectProxyCommand {
 
 #[derive(Debug, Args)]
 pub struct UiCommand {
+    #[command(subcommand)]
+    pub action: Option<UiAction>,
+    #[arg(short = 'c', long, default_value = "config/ui.toml")]
+    pub config: PathBuf,
+    /// Detach and run as a background daemon process.
+    #[arg(long, default_value_t = false)]
+    pub daemon: bool,
     /// Bind address for the web UI.
-    #[arg(long, default_value = "127.0.0.1")]
-    pub bind: String,
+    #[arg(long)]
+    pub bind: Option<String>,
     /// Listen port for the web UI.
-    #[arg(long, default_value_t = 19091)]
-    pub port: u16,
+    #[arg(long)]
+    pub port: Option<u16>,
     /// PID file of the target rama-proxy server process.
-    #[arg(long, default_value = "config/rama-proxy-server.pid")]
-    pub pid_file: PathBuf,
+    #[arg(long)]
+    pub pid_file: Option<PathBuf>,
+    /// PID file of the built-in UI process.
+    #[arg(long)]
+    pub ui_pid_file: Option<PathBuf>,
     /// Local admin socket used to query live server stats.
-    #[arg(long, default_value = "config/rama-proxy-server.stats.sock")]
-    pub stats_socket: PathBuf,
+    #[arg(long)]
+    pub stats_socket: Option<PathBuf>,
     /// Sampling interval in milliseconds.
-    #[arg(long, default_value_t = 2000)]
-    pub interval_ms: u64,
+    #[arg(long)]
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UiAction {
+    /// Initialize a default UI TOML config file.
+    Init {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Stop the background UI process.
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]

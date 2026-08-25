@@ -2,6 +2,22 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Planned Release 1.2.3 (not released)
+
+This section records changes intended for the future 1.2.3 release. The current
+package version remains unchanged until that release is prepared.
+
+- Add top-level `rama-proxy stop` to stop any running server, client, and UI daemon.
+- Add `ui stop` and `ui --daemon` for managing the built-in web UI process.
+- Add `ui init` to generate `config/ui.toml` with bind address, port, PID files,
+  stats socket, and sampling interval settings.
+- Make UI settings load from `config/ui.toml` by default, with command-line
+  options overriding the config file.
+- Keep the last successful stats snapshot when the UI stats socket temporarily
+  fails, so client names and tunnel data do not fall back to `/proc` data.
+- Fix heartbeat tunnel reporting so active tunnels are not incorrectly removed
+  because of the previous 600-second age filter.
+
 ## Release 1.2.1
 
 This release hardens the server against slow or malformed tunnel clients and
@@ -68,6 +84,10 @@ rama-proxy client check
 rama-proxy client --config config/client.toml
 
 rama-proxy ui
+rama-proxy ui stop
+rama-proxy ui init
+rama-proxy ui --config config/ui.toml --daemon
+rama-proxy stop
 rama-proxy ui --port 19091
 rama-proxy ui --pid-file config/rama-proxy-server.pid
 ```
@@ -78,9 +98,13 @@ Command notes:
 - `server stats` prints the latest server connection snapshot JSON
 - `client` starts the local Clash-facing SOCKS5 service when no nested command is provided
 - `ui` starts a built-in web UI for observing a running `server` process on Linux
+- `ui stop` stops the UI process recorded in `config/rama-proxy-ui.pid`
+- `ui init` writes a default `config/ui.toml` file
+- `stop` stops the background `server`, `client`, and `ui` processes when present
 - `init` writes a default config file for that mode
 - `check` validates the config file and exits
 - `--daemon` can be used with either `server` or `client`
+- `--daemon` can also be used with `ui` to detach the web UI as a background process
 
 ## Web UI
 
@@ -97,7 +121,7 @@ Example:
 ```powershell
 rama-proxy server --config config/server.toml --daemon
 rama-proxy server stats
-rama-proxy ui
+rama-proxy ui --daemon
 ```
 
 Then open:
@@ -106,11 +130,23 @@ Then open:
 
 Supported flags:
 
+The UI now reads defaults from `config/ui.toml` (or `--config <path>`). CLI flags override the config file values. Run `rama-proxy ui init` to generate a default config:
+
+```toml
+bind = "127.0.0.1"
+port = 19091
+pid_file = "config/rama-proxy-server.pid"
+ui_pid_file = "config/rama-proxy-ui.pid"
+stats_socket = "config/rama-proxy-server.stats.sock"
+interval_ms = 2000
+```
+
 - `--bind <ip>`
 - `--port <port>`
 - `--pid-file <path>`
 - `--stats-socket <path>`
 - `--interval-ms <millis>`
+- `--daemon`
 
 Current UI data comes from polling `/proc/<pid>` on Linux, so:
 

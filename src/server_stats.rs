@@ -157,8 +157,12 @@ impl ServerStatsRegistry {
         self.update(id, |entry| {
             entry.state = "heartbeat".to_string();
             entry.in_use = false;
-        }).await;
-        self.heartbeat_by_client.write().await.insert(client_id.to_string(), id)
+        })
+        .await;
+        self.heartbeat_by_client
+            .write()
+            .await
+            .insert(client_id.to_string(), id)
     }
 
     pub fn close_connection(&self, id: u64) {
@@ -197,11 +201,7 @@ impl ServerStatsRegistry {
             .read()
             .await
             .values()
-            .filter(|entry| {
-                entry.client_id == client_id
-                    && entry.state != "heartbeat"
-                    && now_unix_secs().saturating_sub(entry.accepted_at_unix_secs) >= 600
-            })
+            .filter(|entry| entry.client_id == client_id && entry.state != "heartbeat")
             .map(|entry| entry.id)
             .collect()
     }
