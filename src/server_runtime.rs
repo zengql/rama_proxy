@@ -208,7 +208,6 @@ where
     let handshake = server_handshake(
         stream,
         &config.auth.shared_secret,
-        config.auth.require_client_id,
     );
     let client_id = tokio::time::timeout(
         std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),

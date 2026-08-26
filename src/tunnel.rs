@@ -528,7 +528,6 @@ where
 pub async fn server_handshake<S>(
     stream: &mut S,
     shared_secret: &str,
-    require_client_id: bool,
 ) -> Result<String, AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -546,6 +545,12 @@ where
             "unsupported tunnel version: {version}"
         )));
     }
+    if version == VERSION_LEGACY {
+        stream.write_u8(STATUS_BAD_REQUEST).await?;
+        return Err(AppError::InvalidConfig(
+            "legacy tunnel client is not supported; upgrade the client binary".to_string(),
+        ));
+    }
     let got_secret = read_string(stream).await?;
     if got_secret != shared_secret {
         stream.write_u8(STATUS_AUTH_FAILED).await?;
@@ -558,11 +563,11 @@ where
     } else {
         String::new()
     };
-    if require_client_id && client_id.trim().is_empty() {
+    if client_id.trim().is_empty() {
         stream.write_u8(STATUS_CLIENT_ID_REQUIRED).await?;
         stream.flush().await?;
         return Err(AppError::InvalidConfig(
-            "client_id is required by server auth policy".to_string(),
+            "client_id is required; anonymous tunnel clients are not supported".to_string(),
         ));
     }
     stream.write_u8(STATUS_OK).await?;
