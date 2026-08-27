@@ -20,9 +20,8 @@ use crate::{
     tls::build_client_tls_context,
     tunnel::{
         TunnelPool, opcode_is_close, opcode_is_ping, opcode_is_pong, opcode_is_udp_packet,
-        resolve_client_id,
-        read_opcode, read_response, read_udp_packet, run_heartbeat, write_close, write_open_connect,
-        write_open_udp, write_ping, write_pong, write_udp_packet,
+        read_opcode, read_response, read_udp_packet, resolve_client_id, run_heartbeat, write_close,
+        write_open_connect, write_open_udp, write_ping, write_pong, write_udp_packet,
     },
 };
 
@@ -49,14 +48,16 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
         };
         loop {
             let result = match build_client_tls_context(&heartbeat_config.tls) {
-                Ok(tls) => run_heartbeat(
-                    server_addr,
-                    &heartbeat_config.client.shared_secret,
-                    &resolve_client_id(&heartbeat_config.client.client_id),
-                    Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
-                    tls,
-                )
-                .await,
+                Ok(tls) => {
+                    run_heartbeat(
+                        server_addr,
+                        &heartbeat_config.client.shared_secret,
+                        &resolve_client_id(&heartbeat_config.client.client_id),
+                        Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
+                        tls,
+                    )
+                    .await
+                }
                 Err(err) => Err(err),
             };
             match result {

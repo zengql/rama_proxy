@@ -46,7 +46,7 @@ async fn main() -> Result<(), AppError> {
 
 async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
     match cmd.action {
-        Some(ModeAction::Stop) => stop_daemon("server", &cmd.config),
+        Some(ModeAction::Stop) => stop_server_daemon(&cmd.config),
         Some(ModeAction::Init { output, force }) => {
             let output = output.unwrap_or_else(|| cmd.config.clone());
             ServerConfigFile::write_default_to_path(&output, force)?;
@@ -72,7 +72,10 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
         }
         None => {
             if cmd.daemon {
-                let extra_args = vec![
+                if cmd.ui {
+                    spawn_ui_daemon(&cmd.config, &cmd.stats_socket)?;
+                }
+                let mut extra_args = vec![
                     OsString::from("--stats-socket"),
                     cmd.stats_socket.as_os_str().to_os_string(),
                 ];
@@ -81,7 +84,17 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
             let config = ServerConfigFile::from_path(&cmd.config)?;
             config.validate()?;
             logging::init(&config.log.level)?;
-            server_runtime::run(config, cmd.stats_socket).await
+            let mut ui_child = if cmd.ui {
+                Some(spawn_ui_child()?)
+            } else {
+                None
+            };
+            let result = server_runtime::run(config, cmd.stats_socket).await;
+            if let Some(child) = ui_child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            result
         }
     }
 }
@@ -218,6 +231,62 @@ fn stop_daemon(mode: &str, config_path: &Path) -> Result<(), AppError> {
         .unwrap_or(Path::new("."))
         .join(format!("rama-proxy-{mode}.pid"));
     stop_pid_file(mode, &pid_path)
+}
+
+fn stop_server_daemon(config_path: &Path) -> Result<(), AppError> {
+    let result = stop_daemon("server", config_path);
+    let ui_pid_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("rama-proxy-ui.pid");
+    let ui_result = stop_pid_file("ui", &ui_pid_path);
+    let server_missing = matches!(&result, Err(err) if is_missing_pid_error(err));
+    let ui_missing = matches!(&ui_result, Err(err) if is_missing_pid_error(err));
+
+    if server_missing && ui_missing {
+        return Err(result.expect_err("server stop result should be an error"));
+    }
+    if let Err(err) = result {
+        if !server_missing {
+            return Err(err);
+        }
+    }
+    if let Err(err) = ui_result {
+        if !ui_missing {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn spawn_ui_daemon(server_config_path: &Path, stats_socket: &Path) -> Result<(), AppError> {
+    let ui_config_path = server_config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("ui.toml");
+    let extra_args = [
+        OsString::from("--stats-socket"),
+        stats_socket.as_os_str().to_os_string(),
+    ];
+    spawn_daemon("ui", &ui_config_path, &extra_args)
+}
+
+fn is_missing_pid_error(error: &AppError) -> bool {
+    matches!(error, AppError::Boxed(message) if message.starts_with("read ") && message.contains("pid file"))
+}
+
+fn spawn_ui_child() -> Result<Child, AppError> {
+    let exe = std::env::current_exe()?;
+    let child = ProcessCommand::new(exe)
+        .arg("ui")
+        .arg("--config")
+        .arg("config/ui.toml")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    println!("ui child started: pid={}", child.id());
+    Ok(child)
 }
 
 fn stop_pid_file(mode: &str, pid_path: &Path) -> Result<(), AppError> {

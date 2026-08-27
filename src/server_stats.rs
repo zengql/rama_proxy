@@ -145,6 +145,21 @@ impl ServerStatsRegistry {
         .await;
     }
 
+    pub async fn reap_stale_handshakes(&self, timeout_secs: u64) {
+        let cutoff = now_unix_secs().saturating_sub(timeout_secs.max(1));
+        let stale_ids = {
+            let connections = self.connections.read().await;
+            connections
+                .values()
+                .filter(|entry| entry.state == "handshake" && entry.accepted_at_unix_secs <= cutoff)
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+        for id in stale_ids {
+            self.remove_connection(id).await;
+        }
+    }
+
     pub async fn remove_connection(&self, id: u64) {
         self.connections.write().await.remove(&id);
         self.heartbeat_by_client
@@ -229,6 +244,7 @@ impl ServerStatsRegistry {
         for item in &items {
             summary.total_connections += 1;
             match item.state.as_str() {
+                "heartbeat" => summary.heartbeat_connections += 1,
                 "idle" => summary.idle_connections += 1,
                 "active-tcp" => summary.active_tcp_connections += 1,
                 "active-udp" => summary.active_udp_connections += 1,
@@ -301,6 +317,8 @@ pub struct ServerStatsSnapshot {
 pub struct ServerStatsSummary {
     pub total_connections: usize,
     pub handshake_connections: usize,
+    #[serde(default)]
+    pub heartbeat_connections: usize,
     pub idle_connections: usize,
     pub active_tcp_connections: usize,
     pub active_udp_connections: usize,

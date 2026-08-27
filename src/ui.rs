@@ -1160,6 +1160,7 @@ fn index_html() -> &'static str {
             label: key,
             total: 0,
             idle: 0,
+            heartbeat: 0,
             activeTcp: 0,
             activeUdp: 0,
             inUse: 0,
@@ -1170,6 +1171,7 @@ fn index_html() -> &'static str {
         }
         const group = groups.get(key);
         group.total += 1;
+        if (item.state === 'heartbeat') group.heartbeat += 1;
         if (item.state === 'idle') group.idle += 1;
         else if (item.state === 'active-tcp') group.activeTcp += 1;
         else if (item.state === 'active-udp') group.activeUdp += 1;
@@ -1218,6 +1220,7 @@ fn index_html() -> &'static str {
         },
         tunnel: {
           total: connections.length,
+          heartbeat: connections.filter((item) => item.state === 'heartbeat').length,
           lastHeartbeat: connections
             .filter((item) => item.state === 'heartbeat')
             .map((item) => item.last_active_unix_secs)
@@ -1946,10 +1949,14 @@ fn index_html_v2() -> &'static str {
             bytesFromClient: 0,
             bytesFromTarget: 0,
             source: 'stats',
+            connections: [],
+            heartbeat: 0,
           });
         }
         const group = groups.get(key);
         group.total += 1;
+        group.connections.push(item);
+        if (item.state === 'heartbeat') group.heartbeat += 1;
         if (item.state === 'idle') group.idle += 1;
         if (item.state === 'active-tcp') group.activeTcp += 1;
         if (item.state === 'active-udp') group.activeUdp += 1;
@@ -1966,7 +1973,9 @@ fn index_html_v2() -> &'static str {
               key,
               label: key,
               total: 0,
+              connections: [],
               idle: 0,
+              heartbeat: 0,
               activeTcp: 0,
               activeUdp: 0,
               inUse: 0,
@@ -2023,6 +2032,7 @@ fn index_html_v2() -> &'static str {
         },
         tunnel: {
           total: connections.length,
+          heartbeat: connections.filter((item) => item.state === 'heartbeat').length,
           idle: connections.filter((item) => item.state === 'idle').length,
           inUse: connections.filter((item) => item.in_use).length,
           activeTcp: connections.filter((item) => item.state === 'active-tcp').length,
@@ -2282,6 +2292,7 @@ fn index_html_v2() -> &'static str {
           title: selected ? selected.label : '-',
           items: [
             ['总数', stats.tunnel.total],
+            ['Heartbeat', stats.tunnel.heartbeat],
             ['Handshake', stats.tunnel.handshake],
             ['Idle', stats.tunnel.idle],
             ['In Use', stats.tunnel.inUse],

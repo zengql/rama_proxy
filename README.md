@@ -8,6 +8,7 @@ This section records changes intended for the future 1.2.3 release. The current
 package version remains unchanged until that release is prepared.
 
 - Add top-level `rama-proxy stop` to stop any running server, client, and UI daemon.
+- Add `server --ui` to start and manage the UI child process together with the server.
 - Add `ui stop` and `ui --daemon` for managing the built-in web UI process.
 - Add `ui init` to generate `config/ui.toml` with bind address, port, PID files,
   stats socket, and sampling interval settings.
@@ -78,6 +79,7 @@ rama-proxy server init
 rama-proxy server check
 rama-proxy server stats
 rama-proxy server --config config/server.toml
+rama-proxy server --config config/server.toml --ui
 
 rama-proxy client init
 rama-proxy client check
@@ -95,6 +97,7 @@ rama-proxy ui --pid-file config/rama-proxy-server.pid
 Command notes:
 
 - `server` starts the remote tunnel server when no nested command is provided
+- `server --ui` starts the built-in UI as a child process and manages it with the server lifecycle
 - `server stats` prints the latest server connection snapshot JSON
 - `client` starts the local Clash-facing SOCKS5 service when no nested command is provided
 - `ui` starts a built-in web UI for observing a running `server` process on Linux
@@ -104,6 +107,7 @@ Command notes:
 - `init` writes a default config file for that mode
 - `check` validates the config file and exits
 - `--daemon` can be used with either `server` or `client`
+- `server --ui --daemon` starts both server and UI in the background
 - `--daemon` can also be used with `ui` to detach the web UI as a background process
 
 ## Web UI

@@ -23,11 +23,11 @@ use crate::{
     server_stats::{ServerStatsRegistry, spawn_stats_server},
     tls::{ServerTlsAcceptor, build_server_tls_acceptor},
     tunnel::{
-        opcode_is_close, opcode_is_connect, opcode_is_heartbeat_open,
-        opcode_is_ping, opcode_is_pong,
-        opcode_is_udp, opcode_is_udp_packet, read_connect_target, read_opcode, read_udp_packet,
-        server_handshake, status_connect_failed, status_resolve_failed, write_close, write_ping,
-        read_heartbeat, write_heartbeat, write_pong, write_response, write_udp_packet,
+        opcode_is_close, opcode_is_connect, opcode_is_heartbeat_open, opcode_is_ping,
+        opcode_is_pong, opcode_is_udp, opcode_is_udp_packet, read_connect_target, read_heartbeat,
+        read_opcode, read_udp_packet, server_handshake, status_connect_failed,
+        status_resolve_failed, write_close, write_heartbeat, write_ping, write_pong,
+        write_response, write_udp_packet,
     },
 };
 
@@ -45,6 +45,17 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
     let stats = ServerStatsRegistry::new();
     let handshake_limiter = std::sync::Arc::new(Semaphore::new(config.server.max_handshakes));
     spawn_stats_server(stats.clone(), stats_socket.clone());
+    let stats_reaper = stats.clone();
+    let handshake_timeout_secs = config.server.handshake_timeout_secs;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            stats_reaper
+                .reap_stale_handshakes(handshake_timeout_secs)
+                .await;
+        }
+    });
 
     info!(
         bind = %listen_addr,
@@ -85,12 +96,19 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
                 continue;
             }
         };
-    tokio::spawn(async move {
-        if let Err(err) =
-            handle_connection(stream, peer, config, tls_acceptor, stats.clone(), handshake_permit).await
-        {
-            warn!(client = %peer, error = %err, "tunnel connection ended with error");
-        }
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection(
+                stream,
+                peer,
+                config,
+                tls_acceptor,
+                stats.clone(),
+                handshake_permit,
+            )
+            .await
+            {
+                warn!(client = %peer, error = %err, "tunnel connection ended with error");
+            }
         });
     }
 }
@@ -205,10 +223,7 @@ async fn handle_connection_io<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let handshake = server_handshake(
-        stream,
-        &config.auth.shared_secret,
-    );
+    let handshake = server_handshake(stream, &config.auth.shared_secret);
     let client_id = tokio::time::timeout(
         std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),
         handshake,
@@ -241,7 +256,8 @@ where
             }
         };
         if opcode_is_heartbeat_open(opcode) {
-            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id).await;
+            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id)
+                .await;
         }
         if opcode_is_ping(opcode) {
             stats.touch(connection_id).await;
@@ -253,7 +269,16 @@ where
             stats
                 .mark_active_tcp(connection_id, target.to_string())
                 .await;
-            return serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id, close_rx).await;
+            return serve_tcp_tunnel(
+                stream,
+                peer,
+                target,
+                &config,
+                stats,
+                connection_id,
+                close_rx,
+            )
+            .await;
         }
         if opcode_is_udp(opcode) {
             stats.mark_active_udp(connection_id).await;

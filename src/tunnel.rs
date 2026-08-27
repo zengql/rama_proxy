@@ -485,10 +485,8 @@ pub async fn run_heartbeat(
     connect_timeout: Duration,
     tls: Option<ClientTlsContext>,
 ) -> Result<(), AppError> {
-    let mut stream = connect_idle_tunnel(
-        server_addr, shared_secret, client_id, connect_timeout, tls,
-    )
-    .await?;
+    let mut stream =
+        connect_idle_tunnel(server_addr, shared_secret, client_id, connect_timeout, tls).await?;
     write_heartbeat_open(&mut stream).await?;
     loop {
         let (_, ids) = read_heartbeat(&mut stream).await?;
@@ -525,10 +523,7 @@ where
     }
 }
 
-pub async fn server_handshake<S>(
-    stream: &mut S,
-    shared_secret: &str,
-) -> Result<String, AppError>
+pub async fn server_handshake<S>(stream: &mut S, shared_secret: &str) -> Result<String, AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -710,7 +705,9 @@ where
     }
     let count = reader.read_u32().await?;
     if count > 65535 {
-        return Err(AppError::InvalidConfig("heartbeat channel batch is too large".to_string()));
+        return Err(AppError::InvalidConfig(
+            "heartbeat channel batch is too large".to_string(),
+        ));
     }
     let mut ids = Vec::with_capacity(count as usize);
     for _ in 0..count {

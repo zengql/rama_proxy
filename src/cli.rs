@@ -42,6 +42,9 @@ pub struct ServerCommand {
     /// Detach and run as a background daemon process.
     #[arg(long, default_value_t = false)]
     pub daemon: bool,
+    /// Start the built-in web UI as a child process.
+    #[arg(long, default_value_t = false)]
+    pub ui: bool,
 }
 
 #[derive(Debug, Args)]
