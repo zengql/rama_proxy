@@ -354,13 +354,28 @@ impl ClientConfigFile {
 
     pub fn validate(&self) -> Result<(), AppError> {
         validate_ip_bind(&self.socks5.bind, "socks5.bind")?;
+        if self.socks5.port == 0 {
+            return Err(AppError::InvalidConfig(
+                "socks5.port must be greater than 0".to_string(),
+            ));
+        }
         validate_http_connect_config(&self.http_connect, &self.socks5)?;
-        self.client.server_addr.parse::<SocketAddr>().map_err(|_| {
-            AppError::InvalidConfig("client.server_addr must be host:port".to_string())
+        let server_addr = self.client.server_addr.parse::<SocketAddr>().map_err(|_| {
+            AppError::InvalidConfig("client.server_addr must be an IP address and port".to_string())
         })?;
+        if server_addr.port() == 0 {
+            return Err(AppError::InvalidConfig(
+                "client.server_addr port must be greater than 0".to_string(),
+            ));
+        }
         if self.client.shared_secret.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "client.shared_secret must not be empty".to_string(),
+            ));
+        }
+        if self.client.client_id.trim().is_empty() {
+            return Err(AppError::InvalidConfig(
+                "client.client_id must not be empty".to_string(),
             ));
         }
         if self.client.client_id.contains('\n') || self.client.client_id.contains('\r') {

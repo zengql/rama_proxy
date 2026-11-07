@@ -576,7 +576,7 @@ pub fn resolve_client_id(configured: &str) -> String {
         return configured.to_string();
     }
 
-    for key in ["COMPUTERNAME", "HOSTNAME"] {
+    for key in ["COMPUTERNAME", "HOSTNAME", "USERNAME", "USER"] {
         if let Ok(value) = std::env::var(key) {
             let value = value.trim();
             if !value.is_empty() {
