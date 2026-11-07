@@ -2,10 +2,25 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
-## Planned Release 1.2.3 (not released)
+## Release 1.3.0
 
-This section records changes intended for the future 1.2.3 release. The current
-package version remains unchanged until that release is prepared.
+This release adds a Windows desktop client and the daemon/UI management work
+previously planned for 1.2.3.
+
+Desktop client (`proxy-gui.exe`, Windows):
+
+- New GPUI-based client that starts and stops `proxy-core.exe` from a single window.
+- Settings editor for tunnel, local listeners, authentication, TLS, logging, and
+  application behavior, persisted to `config/client.toml`.
+- Tray icon with `Open` / `Exit`; the close button can ask, exit, or close to tray.
+  Closing to tray hides the window and the tray menu restores it.
+- The tray icon is verified at startup and recreated automatically after Windows
+  Explorer restarts; tray failures are reported in the UI instead of failing silently.
+- Built-in console view for client output with a `Follow latest` toggle that turns
+  itself off as soon as the console is scrolled manually.
+- `gpui-kit` is upgraded to `0.8` with the `gpui-fast` rendering feature.
+
+CLI, server, and UI changes:
 
 - Add top-level `rama-proxy stop` to stop any running server, client, and UI daemon.
 - Add `ui stop` and `ui --daemon` for managing the built-in web UI process.

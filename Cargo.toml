@@ -9,4 +9,3 @@ edition = "2024"
 [patch.crates-io]
 rama = { path = "proxy-core/vendor/rama" }
 rama-tls-rustls = { path = "proxy-core/vendor/rama-tls-rustls" }
-gpui-pre-http-client-tls = { path = "proxy-gui/vendor/gpui-pre-http-client-tls" }

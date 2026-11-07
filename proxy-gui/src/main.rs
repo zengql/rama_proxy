@@ -6,7 +6,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
+    sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     time::Duration,
 };
 
@@ -24,8 +24,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
-    WindowBounds, WindowOptions, div, prelude::FluentBuilder as _, px, rgb, size,
+    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder as _, px, rgb,
+    size,
 };
 use proxy_core::config::{
     ClientConfigFile, ClientTlsConfig, LocalAuthConfig, LocalHttpConnectConfig, LocalSocks5Config,
@@ -34,11 +35,24 @@ use proxy_core::config::{
 use serde::{Deserialize, Serialize};
 use tray_item::{IconSource, TrayItem};
 
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    System::Threading::GetCurrentProcessId,
+    UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, SW_RESTORE,
+        ShowWindowAsync,
+    },
+};
+
 const APP_NAME: &str = "Rama Proxy Client";
 const ACCENT_DARK: u32 = 0x0d7046;
 const CONSOLE_CHANNEL_CAPACITY: usize = 512;
 const CONSOLE_MAX_BYTES: usize = 512 * 1024;
 const CONSOLE_MAX_LINE_BYTES: usize = 8 * 1024;
+const TRAY_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
+const TRAY_ERROR_PREFIX: &str = "Tray icon unavailable";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -325,6 +339,8 @@ struct ClientView {
     console_sender: SyncSender<String>,
     console_lines: VecDeque<String>,
     console_bytes: usize,
+    console_scroll_handle: ScrollHandle,
+    follow_console: bool,
     process: Option<Child>,
     status: String,
     error: Option<String>,
@@ -368,6 +384,8 @@ impl ClientView {
             console_sender,
             console_lines: VecDeque::new(),
             console_bytes: 0,
+            console_scroll_handle: ScrollHandle::new(),
+            follow_console: false,
             process: None,
             status: "Ready".to_string(),
             error: None,
@@ -474,6 +492,9 @@ impl ClientView {
             self.settings.console_max_lines,
             line,
         );
+        if self.follow_console {
+            self.console_scroll_handle.scroll_to_bottom();
+        }
     }
 
     fn trim_console(&mut self) {
@@ -758,6 +779,8 @@ impl ClientView {
         let settings_view = cx.entity();
         let run_view = settings_view.clone();
         let clear_view = settings_view.clone();
+        let follow_view = settings_view.clone();
+        let manual_scroll_view = settings_view.clone();
         let console_text = if self.console_lines.is_empty() {
             "No console output.".to_string()
         } else {
@@ -866,6 +889,23 @@ impl ClientView {
                             ))),
                     )
                     .child(
+                        Button::new("follow-console")
+                            .flex_none()
+                            .icon(IconName::ChevronDown)
+                            .label("Follow latest")
+                            .tooltip("Toggle automatic scrolling to the newest console output")
+                            .selected(self.follow_console)
+                            .on_click(move |_, _, cx| {
+                                follow_view.update(cx, |state, cx| {
+                                    state.follow_console = !state.follow_console;
+                                    if state.follow_console {
+                                        state.console_scroll_handle.scroll_to_bottom();
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
                         Button::new("clear-console")
                             .flex_none()
                             .icon(IconName::Delete)
@@ -875,6 +915,9 @@ impl ClientView {
                                 clear_view.update(cx, |state, cx| {
                                     state.console_lines.clear();
                                     state.console_bytes = 0;
+                                    if state.follow_console {
+                                        state.console_scroll_handle.scroll_to_bottom();
+                                    }
                                     cx.notify();
                                 });
                             }),
@@ -883,6 +926,7 @@ impl ClientView {
             .child(
                 div()
                     .id("console-scroll")
+                    .track_scroll(&self.console_scroll_handle)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -896,6 +940,14 @@ impl ClientView {
                     .text_sm()
                     .text_color(rgb(0xc8ded4))
                     .whitespace_normal()
+                    .on_scroll_wheel(move |_, _, cx| {
+                        manual_scroll_view.update(cx, |state, cx| {
+                            if state.follow_console {
+                                state.follow_console = false;
+                                cx.notify();
+                            }
+                        });
+                    })
                     .child(SharedString::from(console_text)),
             );
         v_flex()
@@ -978,7 +1030,7 @@ impl ClientView {
                             .child(
                                 Button::new("close-minimize")
                                     .icon(IconName::WindowMinimize)
-                                    .label("Minimize to tray")
+                                    .label("Close to tray")
                                     .on_click(move |_, window, cx| {
                                         apply_close_choice(
                                             &minimize_view,
@@ -1141,7 +1193,7 @@ impl ClientView {
                                     )
                                     .child(
                                         Button::new("close-behavior-tray")
-                                            .label("Minimize to tray")
+                                            .label("Close to tray")
                                             .selected(
                                                 self.settings.close_action
                                                     == CloseAction::MinimizeToTray,
@@ -1346,6 +1398,93 @@ where
         .and_then(|content| toml::from_str(&content).ok())
 }
 
+#[cfg(windows)]
+fn set_window_visible(window: &mut Window, cx: &App, visible: bool) {
+    let Ok(raw_handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32_handle) = raw_handle.as_raw() else {
+        return;
+    };
+    let command = if visible { SW_RESTORE } else { SW_HIDE };
+    let _ = unsafe { ShowWindowAsync(win32_handle.hwnd.into(), command) };
+    if visible {
+        cx.activate(true);
+        window.activate_window();
+    }
+}
+
+#[cfg(windows)]
+fn restore_window_if_hidden(window: &mut Window, cx: &App) {
+    let Ok(raw_handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32_handle) = raw_handle.as_raw() else {
+        return;
+    };
+    if unsafe { IsWindowVisible(win32_handle.hwnd.into()) } == 0 {
+        set_window_visible(window, cx, true);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_window_visible(window: &mut Window, cx: &App, visible: bool) {
+    if visible {
+        cx.activate(true);
+        window.activate_window();
+    } else {
+        cx.hide();
+    }
+}
+
+#[cfg(windows)]
+fn tray_available() -> bool {
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(Some(0)).collect()
+    }
+
+    let class_name = wide("my_window");
+    let window_name = wide("rust_systray_window");
+    let current_process = unsafe { GetCurrentProcessId() };
+    let mut child_after = 0;
+    loop {
+        let window =
+            unsafe { FindWindowExW(0, child_after, class_name.as_ptr(), window_name.as_ptr()) };
+        if window == 0 {
+            return false;
+        }
+        let mut process_id = 0;
+        unsafe {
+            GetWindowThreadProcessId(window, &mut process_id);
+        }
+        if process_id == current_process {
+            return true;
+        }
+        child_after = window;
+    }
+}
+
+#[cfg(not(windows))]
+fn tray_available() -> bool {
+    true
+}
+
+fn hide_to_tray(view: &Entity<ClientView>, window: &mut Window, cx: &mut App) {
+    if tray_available() {
+        set_window_visible(window, cx, false);
+        return;
+    }
+
+    view.update(cx, |state, cx| {
+        state.show_close_confirmation = false;
+        state.error = Some(format!(
+            "{TRAY_ERROR_PREFIX}; the window will stay open while it is restored."
+        ));
+        cx.notify();
+    });
+    set_window_visible(window, cx, true);
+}
+
 fn apply_close_choice(
     view: &Entity<ClientView>,
     action: CloseAction,
@@ -1364,7 +1503,7 @@ fn apply_close_choice(
         }
     });
     match action {
-        CloseAction::MinimizeToTray => window.minimize_window(),
+        CloseAction::MinimizeToTray => hide_to_tray(view, window, cx),
         CloseAction::Exit => {
             window.remove_window();
             cx.quit();
@@ -1412,8 +1551,15 @@ fn proxy_executable() -> PathBuf {
     path
 }
 
+fn create_tray_with_receiver() -> Result<(TrayItem, Receiver<TrayCommand>), String> {
+    let (sender, receiver) = mpsc::channel();
+    let tray = create_tray(sender).map_err(|error| error.to_string())?;
+    Ok((tray, receiver))
+}
+
 fn create_tray(sender: Sender<TrayCommand>) -> Result<TrayItem, tray_item::TIError> {
-    let mut tray = TrayItem::new(APP_NAME, IconSource::Resource("rama-proxy-ladder"))?;
+    // The Windows resource compiler preserves the quoted RC identifier.
+    let mut tray = TrayItem::new(APP_NAME, IconSource::Resource("\"rama-proxy-ladder\""))?;
     let show = sender.clone();
     tray.add_menu_item("Open", move || {
         let _ = show.send(TrayCommand::Show);
@@ -1435,13 +1581,16 @@ fn handle_tray_commands(
             cx.background_executor()
                 .timer(Duration::from_millis(200))
                 .await;
-            let Ok(command) = receiver.try_recv() else {
-                continue;
+            let command = match receiver.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => break,
             };
             let should_continue = cx.update(|cx| match command {
                 TrayCommand::Show => {
-                    cx.activate(true);
-                    let _ = window_handle.update(cx, |_, window, _| window.activate_window());
+                    let _ = window_handle.update(cx, |_, window, window_cx| {
+                        set_window_visible(window, window_cx, true);
+                    });
                     true
                 }
                 TrayCommand::Quit => {
@@ -1456,6 +1605,60 @@ fn handle_tray_commands(
             });
             if !should_continue {
                 break;
+            }
+        }
+    })
+    .detach();
+}
+
+fn monitor_tray(view: Entity<ClientView>, window_handle: gpui_kit::AnyWindowHandle, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(TRAY_MONITOR_INTERVAL).await;
+            let should_continue = cx.update(|cx| !view.read(cx).exiting);
+            if !should_continue {
+                break;
+            }
+            if tray_available() {
+                continue;
+            }
+
+            match create_tray_with_receiver() {
+                Ok((tray, receiver)) => {
+                    cx.update(|cx| {
+                        view.update(cx, |state, cx| {
+                            let had_tray_error = state
+                                .error
+                                .as_deref()
+                                .is_some_and(|error| error.starts_with(TRAY_ERROR_PREFIX));
+                            state._tray = Some(tray);
+                            if had_tray_error {
+                                state.error = None;
+                                cx.notify();
+                            }
+                        });
+                    });
+                    let handler_view = view.clone();
+                    cx.update(|cx| {
+                        handle_tray_commands(receiver, handler_view, window_handle, cx);
+                    });
+                }
+                Err(error) => {
+                    let message = format!(
+                        "{TRAY_ERROR_PREFIX}: {error}; the window will stay open while retrying."
+                    );
+                    cx.update(|cx| {
+                        view.update(cx, |state, cx| {
+                            if state.error.as_deref() != Some(message.as_str()) {
+                                state.error = Some(message.clone());
+                                cx.notify();
+                            }
+                        });
+                        let _ = window_handle.update(cx, |_, window, window_cx| {
+                            restore_window_if_hidden(window, window_cx);
+                        });
+                    });
+                }
             }
         }
     })
@@ -1491,9 +1694,17 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
-            let (tray_tx, tray_rx) = mpsc::channel();
             let (console_tx, console_rx) = mpsc::sync_channel(CONSOLE_CHANNEL_CAPACITY);
-            let tray = create_tray(tray_tx).ok();
+            let (tray, tray_rx, tray_error) = match create_tray_with_receiver() {
+                Ok((tray, receiver)) => (Some(tray), Some(receiver), None),
+                Err(error) => (
+                    None,
+                    None,
+                    Some(format!(
+                        "{TRAY_ERROR_PREFIX}: {error}; retrying automatically."
+                    )),
+                ),
+            };
             let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
             let mut client_view = None;
             let window_handle = cx
@@ -1518,10 +1729,7 @@ fn main() {
                                     true
                                 }
                                 CloseAction::MinimizeToTray => {
-                                    // cx.hide() is a no-op on the bundled GPUI Windows
-                                    // platform, which leaves the window alive and makes
-                                    // the app look impossible to close. Minimize instead.
-                                    window.minimize_window();
+                                    hide_to_tray(&close_view, window, cx);
                                     false
                                 }
                                 CloseAction::Ask => {
@@ -1542,7 +1750,16 @@ fn main() {
             cx.activate(true);
             let _ = window_handle.update(cx, |_, window, _| window.activate_window());
             let client_view = client_view.expect("Client view was not initialized");
-            handle_tray_commands(tray_rx, client_view.clone(), window_handle.into(), cx);
+            if let Some(error) = tray_error {
+                client_view.update(cx, |state, cx| {
+                    state.error = Some(error);
+                    cx.notify();
+                });
+            }
+            if let Some(receiver) = tray_rx {
+                handle_tray_commands(receiver, client_view.clone(), window_handle.into(), cx);
+            }
+            monitor_tray(client_view.clone(), window_handle.into(), cx);
             handle_console_output(console_rx, client_view, cx);
         });
 }
@@ -1552,8 +1769,8 @@ mod tests {
     use std::{collections::VecDeque, sync::mpsc};
 
     use super::{
-        CONSOLE_MAX_BYTES, CONSOLE_MAX_LINE_BYTES, ClientForm, default_client_config_path,
-        push_console_line, spawn_console_reader,
+        CONSOLE_MAX_BYTES, CONSOLE_MAX_LINE_BYTES, ClientForm, create_tray,
+        default_client_config_path, push_console_line, spawn_console_reader, tray_available,
     };
 
     fn valid_form() -> ClientForm {
@@ -1640,6 +1857,16 @@ mod tests {
         let line = receiver.recv().unwrap();
 
         assert_eq!(line, format!("{} ... [truncated]", "x".repeat(8192)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_icon_resource_can_be_created() {
+        let (sender, _receiver) = mpsc::channel();
+        let tray = create_tray(sender).expect("tray icon resource must be loadable");
+        assert!(tray_available());
+        drop(tray);
+        assert!(!tray_available());
     }
 
     #[test]

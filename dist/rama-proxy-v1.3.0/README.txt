@@ -23,7 +23,13 @@ config/         配置文件目录（程序以"当前工作目录"为基准读�
 Settings -> Application -> Close button behavior：
 - Ask            点 X 弹确认框（默认）
 - Exit           点 X 直接退出
-- Minimize to tray  点 X 最小化到任务栏，从托盘图标可 Open / Exit
+- Close to tray  点 X 收起到托盘（任务栏不再显示），从托盘图标可 Open / Exit
+
+托盘说明
+--------
+- 托盘图标失效时（例如 Windows Explorer 重启），程序会自动重建托盘，并在界面顶部提示。
+- 控制台输出区可勾选 Follow latest 自动跟随最新日志；手动滚动后会自动取消跟随。
+
 
 命令行（proxy-core.exe，可选）
 ------------------------------
