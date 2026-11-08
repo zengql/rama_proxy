@@ -2,16 +2,17 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use rama::net::address::{Host, HostWithPort};
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::{config::TunnelClientConfig, tls::ClientTlsContext};
@@ -46,14 +47,38 @@ const MAX_STALE_TUNNELS_PER_ACQUIRE: usize = 2;
 const MAX_REFILL_BACKOFF: Duration = Duration::from_secs(30);
 
 struct IdleTunnel {
+    tunnel_id: u64,
     stream: TunnelStream,
     verified_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelPoolSnapshot {
+    pub max_idle_size: usize,
+    pub warm_idle_target: usize,
+    pub idle: usize,
+    pub inspecting_idle: usize,
+    pub connecting: usize,
+    pub active: usize,
+    pub consecutive_failures: usize,
+    pub next_refill_allowed_in_secs: Option<u64>,
+    pub created_total: usize,
+    pub failed_total: usize,
+    pub reaped_stale_total: usize,
+    pub last_success_age_secs: Option<u64>,
+    pub last_refill_error: Option<String>,
 }
 
 struct RefillState {
     consecutive_failures: usize,
     next_allowed_at: Option<Instant>,
     cooldown_logged_for: Option<Instant>,
+    created_total: usize,
+    failed_total: usize,
+    reaped_stale_total: usize,
+    last_success_at: Option<Instant>,
+    last_refill_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -69,6 +94,7 @@ pub struct TunnelPool {
     inspecting_idle: Arc<AtomicUsize>,
     connecting: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
+    next_tunnel_id: Arc<AtomicU64>,
     refill_state: Arc<Mutex<RefillState>>,
     tls: Option<ClientTlsContext>,
 }
@@ -105,24 +131,61 @@ impl TunnelPool {
             inspecting_idle: Arc::new(AtomicUsize::new(0)),
             connecting: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
+            next_tunnel_id: Arc::new(AtomicU64::new(1)),
             refill_state: Arc::new(Mutex::new(RefillState::default())),
             tls,
         })
     }
 
-    pub fn spawn_maintainer(&self) {
+    pub fn spawn_maintainer(&self) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            this.schedule_refill().await;
             loop {
                 this.reap_idle_tunnels().await;
+                this.schedule_refill().await;
                 tokio::time::sleep(POOL_MAINTENANCE_INTERVAL).await;
             }
-        });
+        })
     }
 
     fn idle_len(&self) -> usize {
         self.max_idle_size.saturating_sub(self.idle_tx.capacity())
+    }
+
+    pub async fn snapshot(&self) -> TunnelPoolSnapshot {
+        let refill_state = self.refill_state.lock().await;
+        let now = Instant::now();
+        let next_refill_allowed_in_secs = refill_state
+            .next_allowed_at
+            .and_then(|next_allowed_at| next_allowed_at.checked_duration_since(now))
+            .map(|remaining| {
+                remaining
+                    .as_millis()
+                    .saturating_add(999)
+                    .saturating_div(1_000) as u64
+            });
+
+        TunnelPoolSnapshot {
+            max_idle_size: self.max_idle_size,
+            warm_idle_target: self.warm_idle_target,
+            idle: self.idle_len(),
+            inspecting_idle: self.inspecting_idle.load(Ordering::Relaxed),
+            connecting: self.connecting.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            consecutive_failures: refill_state.consecutive_failures,
+            next_refill_allowed_in_secs,
+            created_total: refill_state.created_total,
+            failed_total: refill_state.failed_total,
+            reaped_stale_total: refill_state.reaped_stale_total,
+            last_success_age_secs: refill_state
+                .last_success_at
+                .map(|last_success_at| last_success_at.elapsed().as_secs()),
+            last_refill_error: refill_state.last_refill_error.clone(),
+        }
+    }
+
+    fn allocate_tunnel_id(&self) -> u64 {
+        self.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
     }
 
     async fn schedule_refill(&self) {
@@ -181,6 +244,7 @@ impl TunnelPool {
     }
 
     fn spawn_fill_one(&self) {
+        let tunnel_id = self.allocate_tunnel_id();
         let sender = self.idle_tx.clone();
         let server_addr = self.server_addr;
         let shared_secret = self.shared_secret.clone();
@@ -198,6 +262,16 @@ impl TunnelPool {
             .as_ref()
             .map(|tls| tls.client_auth_configured)
             .unwrap_or(false);
+        info!(
+            tunnel_id,
+            server_addr = %server_addr,
+            client_id = %client_id,
+            tls_backend,
+            tls_server_name,
+            client_auth_configured,
+            timeout_secs = connect_timeout.as_secs(),
+            "starting idle tunnel creation"
+        );
         tokio::spawn(async move {
             let result = connect_idle_tunnel(
                 server_addr,
@@ -205,22 +279,34 @@ impl TunnelPool {
                 &client_id,
                 connect_timeout,
                 tls,
+                tunnel_id,
+                "warm-refill",
             )
             .await;
             match result {
                 Ok(stream) => {
                     reset_refill_backoff(&refill_state).await;
-                    if sender.send(IdleTunnel::new(stream)).await.is_err() {
+                    if sender
+                        .send(IdleTunnel::new(tunnel_id, stream))
+                        .await
+                        .is_err()
+                    {
                         connecting.fetch_sub(1, Ordering::SeqCst);
-                        warn!("tunnel pool receiver dropped while returning idle tunnel");
+                        warn!(
+                            tunnel_id,
+                            "tunnel pool receiver dropped while returning idle tunnel"
+                        );
                     } else {
                         connecting.fetch_sub(1, Ordering::SeqCst);
+                        info!(tunnel_id, "idle tunnel added to pool");
                     }
                 }
                 Err(err) => {
                     connecting.fetch_sub(1, Ordering::SeqCst);
-                    let (failures, backoff_secs) = register_refill_failure(&refill_state).await;
+                    let (failures, backoff_secs) =
+                        register_refill_failure(&refill_state, &err.to_string()).await;
                     warn!(
+                        tunnel_id,
                         server_addr = %server_addr,
                         client_id = %client_id,
                         timeout_secs = connect_timeout.as_secs(),
@@ -230,7 +316,7 @@ impl TunnelPool {
                         consecutive_failures = failures,
                         backoff_secs,
                         error = %err,
-                        "failed to create idle tunnel"
+                        "failed to create idle tunnel; refill will back off"
                     );
                 }
             }
@@ -255,7 +341,9 @@ impl TunnelPool {
                     }
                     Err(err) => {
                         stale_count += 1;
+                        record_stale_tunnel(&self.refill_state).await;
                         warn!(
+                            tunnel_id = idle_tunnel.tunnel_id,
                             stale_count,
                             max_stale = MAX_STALE_TUNNELS_PER_ACQUIRE,
                             error = %err,
@@ -275,6 +363,11 @@ impl TunnelPool {
                 }
             }
 
+            let idle_remaining = self.idle_len().saturating_sub(1);
+            debug!(
+                tunnel_id = idle_tunnel.tunnel_id,
+                idle_remaining, "reusing verified pooled tunnel"
+            );
             self.active.fetch_add(1, Ordering::SeqCst);
             self.schedule_refill().await;
             return Ok(TunnelLease {
@@ -284,35 +377,56 @@ impl TunnelPool {
         }
 
         self.schedule_refill().await;
-        let stream = connect_idle_tunnel(
+        let tunnel_id = self.allocate_tunnel_id();
+        info!(
+            tunnel_id,
+            server_addr = %self.server_addr,
+            client_id = %self.client_id,
+            "pool is empty; creating fresh tunnel during acquire fallback"
+        );
+        let stream = match connect_idle_tunnel(
             self.server_addr,
             &self.shared_secret,
             &self.client_id,
             self.connect_timeout,
             self.tls.clone(),
+            tunnel_id,
+            "acquire-fallback",
         )
         .await
-        .map_err(|err| {
-            warn!(
-                server_addr = %self.server_addr,
-                client_id = %self.client_id,
-                timeout_secs = self.connect_timeout.as_secs(),
-                tls_backend = self.tls.as_ref().map(|tls| tls.backend).unwrap_or("plain"),
-                tls_server_name = self
-                    .tls
-                    .as_ref()
-                    .map(|tls| tls.server_name_display.as_str())
-                    .unwrap_or(""),
-                client_auth_configured = self
-                    .tls
-                    .as_ref()
-                    .map(|tls| tls.client_auth_configured)
-                    .unwrap_or(false),
-                error = %err,
-                "failed to create fresh tunnel during acquire fallback"
-            );
-            err
-        })?;
+        {
+            Ok(stream) => {
+                reset_refill_backoff(&self.refill_state).await;
+                info!(tunnel_id, "fresh acquire fallback tunnel is ready");
+                stream
+            }
+            Err(err) => {
+                let (failures, backoff_secs) =
+                    register_refill_failure(&self.refill_state, &err.to_string()).await;
+                warn!(
+                    tunnel_id,
+                    server_addr = %self.server_addr,
+                    client_id = %self.client_id,
+                    timeout_secs = self.connect_timeout.as_secs(),
+                    tls_backend = self.tls.as_ref().map(|tls| tls.backend).unwrap_or("plain"),
+                    tls_server_name = self
+                        .tls
+                        .as_ref()
+                        .map(|tls| tls.server_name_display.as_str())
+                        .unwrap_or(""),
+                    client_auth_configured = self
+                        .tls
+                        .as_ref()
+                        .map(|tls| tls.client_auth_configured)
+                        .unwrap_or(false),
+                    consecutive_failures = failures,
+                    backoff_secs,
+                    error = %err,
+                    "failed to create fresh tunnel during acquire fallback"
+                );
+                return Err(err);
+            }
+        };
         self.active.fetch_add(1, Ordering::SeqCst);
         Ok(TunnelLease {
             inner: stream,
@@ -344,12 +458,21 @@ impl TunnelPool {
             match probe_idle_tunnel(&mut idle_tunnel.stream).await {
                 Ok(()) => {
                     idle_tunnel.verified_at = Instant::now();
+                    debug!(
+                        tunnel_id = idle_tunnel.tunnel_id,
+                        "idle tunnel probe succeeded"
+                    );
                     self.return_idle_tunnel(idle_tunnel).await;
                 }
                 Err(err) => {
                     dropped_stale = dropped_stale.saturating_add(1);
+                    record_stale_tunnel(&self.refill_state).await;
                     self.inspecting_idle.fetch_sub(1, Ordering::SeqCst);
-                    warn!(error = %err, "discarding stale idle tunnel during maintenance");
+                    warn!(
+                        tunnel_id = idle_tunnel.tunnel_id,
+                        error = %err,
+                        "discarding stale idle tunnel during maintenance"
+                    );
                 }
             }
         }
@@ -368,8 +491,9 @@ impl TunnelPool {
 }
 
 impl IdleTunnel {
-    fn new(stream: TunnelStream) -> Self {
+    fn new(tunnel_id: u64, stream: TunnelStream) -> Self {
         Self {
+            tunnel_id,
             stream,
             verified_at: Instant::now(),
         }
@@ -382,6 +506,11 @@ impl Default for RefillState {
             consecutive_failures: 0,
             next_allowed_at: None,
             cooldown_logged_for: None,
+            created_total: 0,
+            failed_total: 0,
+            reaped_stale_total: 0,
+            last_success_at: None,
+            last_refill_error: None,
         }
     }
 }
@@ -442,7 +571,16 @@ async fn connect_idle_tunnel(
     client_id: &str,
     connect_timeout: Duration,
     tls: Option<ClientTlsContext>,
+    tunnel_id: u64,
+    purpose: &'static str,
 ) -> Result<TunnelStream, AppError> {
+    debug!(
+        tunnel_id,
+        purpose,
+        server_addr = %server_addr,
+        timeout_secs = connect_timeout.as_secs(),
+        "tcp tunnel dial started"
+    );
     let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(server_addr))
         .await
         .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))??;
@@ -456,6 +594,12 @@ async fn connect_idle_tunnel(
         .as_ref()
         .map(|tls| tls.client_auth_configured)
         .unwrap_or(false);
+    debug!(
+        tunnel_id,
+        purpose,
+        server_addr = %server_addr,
+        "tcp tunnel dial completed"
+    );
     let mut stream: TunnelStream = match tls {
         Some(tls) => Box::new(
             tls.connector
@@ -465,8 +609,18 @@ async fn connect_idle_tunnel(
         ),
         None => Box::new(stream),
     };
+    debug!(
+        tunnel_id,
+        purpose, tls_backend, tls_server_name, "tunnel tls stage completed"
+    );
     client_handshake(&mut stream, shared_secret, client_id).await?;
+    debug!(
+        tunnel_id,
+        purpose, client_id, "tunnel authentication completed"
+    );
     info!(
+        tunnel_id,
+        purpose,
         server_addr = %server_addr,
         client_id,
         tls_enabled = tls_backend != "plain",
@@ -484,15 +638,43 @@ pub async fn run_heartbeat(
     client_id: &str,
     connect_timeout: Duration,
     tls: Option<ClientTlsContext>,
+    heartbeat_id: u64,
+    read_timeout: Duration,
 ) -> Result<(), AppError> {
     let mut stream = connect_idle_tunnel(
-        server_addr, shared_secret, client_id, connect_timeout, tls,
+        server_addr,
+        shared_secret,
+        client_id,
+        connect_timeout,
+        tls,
+        heartbeat_id,
+        "heartbeat",
     )
     .await?;
     write_heartbeat_open(&mut stream).await?;
+    info!(
+        heartbeat_id,
+        server_addr = %server_addr,
+        client_id,
+        read_timeout_secs = read_timeout.as_secs(),
+        "heartbeat channel established"
+    );
     loop {
-        let (_, ids) = read_heartbeat(&mut stream).await?;
+        let (_, ids) = tokio::time::timeout(read_timeout, read_heartbeat(&mut stream))
+            .await
+            .map_err(|_| {
+                AppError::InvalidConfig(format!(
+                    "heartbeat read timed out after {} seconds",
+                    read_timeout.as_secs()
+                ))
+            })??;
         write_heartbeat_ack(&mut stream, &ids).await?;
+        info!(
+            heartbeat_id,
+            tunnel_count = ids.len(),
+            tunnel_ids = ?ids,
+            "heartbeat tunnel snapshot received"
+        );
     }
 }
 
@@ -705,7 +887,9 @@ where
     }
     let count = reader.read_u32().await?;
     if count > 65535 {
-        return Err(AppError::InvalidConfig("heartbeat channel batch is too large".to_string()));
+        return Err(AppError::InvalidConfig(
+            "heartbeat channel batch is too large".to_string(),
+        ));
     }
     let mut ids = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -867,15 +1051,28 @@ async fn reset_refill_backoff(refill_state: &Arc<Mutex<RefillState>>) {
     refill_state.consecutive_failures = 0;
     refill_state.next_allowed_at = None;
     refill_state.cooldown_logged_for = None;
+    refill_state.created_total = refill_state.created_total.saturating_add(1);
+    refill_state.last_success_at = Some(Instant::now());
+    refill_state.last_refill_error = None;
 }
 
-async fn register_refill_failure(refill_state: &Arc<Mutex<RefillState>>) -> (usize, u64) {
+async fn register_refill_failure(
+    refill_state: &Arc<Mutex<RefillState>>,
+    error: &str,
+) -> (usize, u64) {
     let mut refill_state = refill_state.lock().await;
     refill_state.consecutive_failures = refill_state.consecutive_failures.saturating_add(1);
+    refill_state.failed_total = refill_state.failed_total.saturating_add(1);
+    refill_state.last_refill_error = Some(error.to_string());
     let backoff = compute_refill_backoff(refill_state.consecutive_failures);
     refill_state.next_allowed_at = Some(Instant::now() + backoff);
     refill_state.cooldown_logged_for = None;
     (refill_state.consecutive_failures, backoff.as_secs())
+}
+
+async fn record_stale_tunnel(refill_state: &Arc<Mutex<RefillState>>) {
+    let mut refill_state = refill_state.lock().await;
+    refill_state.reaped_stale_total = refill_state.reaped_stale_total.saturating_add(1);
 }
 
 fn compute_refill_backoff(consecutive_failures: usize) -> Duration {

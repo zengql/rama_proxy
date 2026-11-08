@@ -2,6 +2,33 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Release 1.4.0
+
+This release adds the Android local SOCKS5 client and the core capabilities it
+needs while preserving the desktop and CLI components.
+
+Android and embedding:
+
+- Add the `proxy-mobile` Tauri 2 + SvelteKit + Rust application.
+- Listen only on `127.0.0.1`; do not add VPN/VpnService or global traffic capture.
+- Add shutdown-aware embedded client entry points with readiness notification and
+  periodic tunnel-pool snapshots.
+- Support PEM CA import through Android's Storage Access Framework.
+- Add optional SOCKS5 UDP ASSOCIATE support; UDP remains disabled by default and
+  fragmented datagrams are rejected.
+- Add bounded in-memory/UI logs and rotating on-disk logs.
+
+Tunnel and TLS changes:
+
+- Use `rustls` and `tokio-rustls` directly with the ring backend.
+- Add pool refill backoff, stale-tunnel reaping, failure diagnostics, and heartbeat
+  connection statistics.
+- Keep TCP pool warm-up independent from UDP ASSOCIATE.
+- Reject `tls.insecure_skip_verify` when TLS is enabled.
+
+The Android release is version `1.4.0` with `versionCode` `1400`. See the repository
+release notes and `docs/PROJECT-NOTES.md` for build, signing, APK verification, and
+Android background-behavior details.
 ## Release 1.3.0
 
 This release adds a Windows desktop client and the daemon/UI management work

@@ -1159,6 +1159,8 @@ fn index_html() -> &'static str {
             key,
             label: key,
             total: 0,
+            handshake: 0,
+            heartbeat: 0,
             idle: 0,
             activeTcp: 0,
             activeUdp: 0,
@@ -1170,6 +1172,8 @@ fn index_html() -> &'static str {
         }
         const group = groups.get(key);
         group.total += 1;
+        if (item.state === 'handshake') group.handshake += 1;
+        if (item.state === 'heartbeat') group.heartbeat += 1;
         if (item.state === 'idle') group.idle += 1;
         else if (item.state === 'active-tcp') group.activeTcp += 1;
         else if (item.state === 'active-udp') group.activeUdp += 1;
@@ -1223,6 +1227,7 @@ fn index_html() -> &'static str {
             .map((item) => item.last_active_unix_secs)
             .sort((a, b) => b - a)[0] || 0,
           handshake: connections.filter((item) => item.state === 'handshake').length,
+          heartbeat: connections.filter((item) => item.state === 'heartbeat').length,
           idle: connections.filter((item) => item.state === 'idle').length,
           inUse: connections.filter((item) => item.in_use).length,
           activeTcp: connections.filter((item) => item.state === 'active-tcp').length,
@@ -1266,6 +1271,8 @@ fn index_html() -> &'static str {
       const summary = stats.summary || {};
       const items = [
         ['Tunnel 总数', summary.total_connections ?? 0],
+        ['Handshake', summary.handshake_connections ?? 0],
+        ['Heartbeat', summary.heartbeat_connections ?? 0],
         ['Idle', summary.idle_connections ?? 0],
         ['Active TCP', summary.active_tcp_connections ?? 0],
         ['Active UDP', summary.active_udp_connections ?? 0],
@@ -1320,6 +1327,8 @@ fn index_html() -> &'static str {
               .map((item) => item.last_active_unix_secs)
               .sort((a, b) => b - a)[0] || 0)],
             ['Connections', selected.total],
+            ['Handshake', selected.handshake],
+            ['Heartbeat', selected.heartbeat],
             ['Idle', selected.idle],
             ['Active TCP', selected.activeTcp],
             ['Active UDP', selected.activeUdp],
@@ -1331,6 +1340,8 @@ fn index_html() -> &'static str {
             ['Client Scope', 'All'],
             ['Distinct Clients', groups.length],
             ['Connections', (snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.total_connections) || 0],
+            ['Handshake', (snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.handshake_connections) || 0],
+            ['Heartbeat', (snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.heartbeat_connections) || 0],
             ['In Use', (snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.in_use_connections) || 0],
             ['Upload', fmtBytes((snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.bytes_from_client) || 0)],
             ['Download', fmtBytes((snapshot.live_stats && snapshot.live_stats.summary && snapshot.live_stats.summary.bytes_from_target) || 0)],
@@ -1709,6 +1720,7 @@ fn index_html_v2() -> &'static str {
     }
     .proto-badge { background: rgba(47, 111, 237, 0.1); color: var(--accent); }
     .status-badge.idle { background: rgba(124, 142, 173, 0.14); color: #64748b; }
+    .status-badge.heartbeat { background: rgba(138, 92, 246, 0.14); color: #7c3aed; }
     .status-badge.active-tcp { background: rgba(47, 111, 237, 0.14); color: #1d4ed8; }
     .status-badge.active-udp { background: rgba(14, 165, 164, 0.16); color: #0f766e; }
     .status-badge.yes { background: rgba(15, 159, 110, 0.12); color: var(--ok); }
@@ -1939,6 +1951,8 @@ fn index_html_v2() -> &'static str {
             key,
             label: key,
             total: 0,
+            handshake: 0,
+            heartbeat: 0,
             idle: 0,
             activeTcp: 0,
             activeUdp: 0,
@@ -1950,6 +1964,8 @@ fn index_html_v2() -> &'static str {
         }
         const group = groups.get(key);
         group.total += 1;
+        if (item.state === 'handshake') group.handshake += 1;
+        if (item.state === 'heartbeat') group.heartbeat += 1;
         if (item.state === 'idle') group.idle += 1;
         if (item.state === 'active-tcp') group.activeTcp += 1;
         if (item.state === 'active-udp') group.activeUdp += 1;
@@ -1966,6 +1982,8 @@ fn index_html_v2() -> &'static str {
               key,
               label: key,
               total: 0,
+              handshake: 0,
+              heartbeat: 0,
               idle: 0,
               activeTcp: 0,
               activeUdp: 0,
@@ -2023,6 +2041,8 @@ fn index_html_v2() -> &'static str {
         },
         tunnel: {
           total: connections.length,
+          handshake: connections.filter((item) => item.state === 'handshake').length,
+          heartbeat: connections.filter((item) => item.state === 'heartbeat').length,
           idle: connections.filter((item) => item.state === 'idle').length,
           inUse: connections.filter((item) => item.in_use).length,
           activeTcp: connections.filter((item) => item.state === 'active-tcp').length,
@@ -2134,6 +2154,8 @@ fn index_html_v2() -> &'static str {
           title: '通道',
           items: [
             ['总数', tunnel.total_connections ?? 0],
+            ['Handshake', tunnel.handshake_connections ?? 0],
+            ['Heartbeat', tunnel.heartbeat_connections ?? 0],
             ['Idle', tunnel.idle_connections ?? 0],
             ['In Use', tunnel.in_use_connections ?? 0],
             ['上下行', `${fmtBytes(tunnel.bytes_from_client ?? 0)} / ${fmtBytes(tunnel.bytes_from_target ?? 0)}`],
@@ -2146,6 +2168,7 @@ fn index_html_v2() -> &'static str {
           items: [
             ['当前连接', tunnel.total_connections ?? 0],
             ['Handshake', tunnel.handshake_connections ?? 0],
+            ['Heartbeat', tunnel.heartbeat_connections ?? 0],
             ['Active TCP', tunnel.active_tcp_connections ?? 0],
             ['Active UDP', tunnel.active_udp_connections ?? 0],
             ['握手超时累计', liveStats.handshake_timeouts ?? 0],
@@ -2220,6 +2243,8 @@ fn index_html_v2() -> &'static str {
         ? [
             ['Client', selected.label],
             ['Tunnel 总数', selected.total],
+            ['Handshake', selected.handshake],
+            ['Heartbeat', selected.heartbeat],
             ['Idle', selected.idle],
             ['In Use', selected.inUse],
             ['Active TCP', selected.activeTcp],
@@ -2231,6 +2256,8 @@ fn index_html_v2() -> &'static str {
             ['Client Scope', 'ALL'],
             ['Distinct Clients', groups.length],
             ['Tunnel 总数', tunnel.total_connections ?? 0],
+            ['Handshake', tunnel.handshake_connections ?? 0],
+            ['Heartbeat', tunnel.heartbeat_connections ?? 0],
             ['In Use', tunnel.in_use_connections ?? 0],
             ['Active TCP', tunnel.active_tcp_connections ?? 0],
             ['Active UDP', tunnel.active_udp_connections ?? 0],
@@ -2251,7 +2278,7 @@ fn index_html_v2() -> &'static str {
       const stats = selected ? computeClientSummary(snapshot, selected.key) : {
         fd: { total: 0, clientSrv: 0, srvExternal: 0, srvInternal: 0 },
         socket: { total: 0, clientSrv: 0, srvExternal: 0, srvInternal: 0 },
-        tunnel: { total: 0, handshake: 0, idle: 0, inUse: 0, activeTcp: 0, activeUdp: 0 },
+        tunnel: { total: 0, handshake: 0, heartbeat: 0, idle: 0, inUse: 0, activeTcp: 0, activeUdp: 0 },
       };
       const sections = [
         {
@@ -2283,6 +2310,7 @@ fn index_html_v2() -> &'static str {
           items: [
             ['总数', stats.tunnel.total],
             ['Handshake', stats.tunnel.handshake],
+            ['Heartbeat', stats.tunnel.heartbeat],
             ['Idle', stats.tunnel.idle],
             ['In Use', stats.tunnel.inUse],
             ['Active TCP', stats.tunnel.activeTcp],
@@ -2358,6 +2386,7 @@ fn index_html_v2() -> &'static str {
       renderFilterChips(tunnelStateChips, [
         { key: 'all', label: '全部' },
         { key: 'handshake', label: 'handshake' },
+        { key: 'heartbeat', label: 'heartbeat' },
         { key: 'active-tcp', label: 'active-tcp' },
         { key: 'active-udp', label: 'active-udp' },
         { key: 'idle', label: 'idle' },
