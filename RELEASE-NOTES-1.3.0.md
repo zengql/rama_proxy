@@ -55,16 +55,10 @@ TLS）保持向后兼容，配置文件无需迁移。
 - 关闭行为的历史配置 `MinimizeToTray` 保留原枚举值，界面文案改为 `Close to tray`，
   语义为隐藏到托盘。
 
-## 发布包内容
+## 历史发布包说明
 
-`dist/rama-proxy-v1.3.0/`：
-
-```text
-proxy-gui.exe    界面程序（双击运行），自动拉起同目录的 proxy-core.exe
-proxy-core.exe   核心程序（客户端 CLI / 服务端 CLI / Web UI）
-config/          client.toml、server.toml 配置模板
-README.txt       面向使用者的中文使用说明
-```
+历史 `dist/rama-proxy-v1.3.0/` 分发目录已移除，其面向使用者的中文说明归档在
+[`proxy-gui/README.txt`](proxy-gui/README.txt)。
 
 ## 已知限制
 

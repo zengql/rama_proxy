@@ -11,7 +11,6 @@ Rama Proxy 是一个基于 Rust 的代理项目，包含桌面端、核心 CLI/�
 | `proxy-core` | 代理核心、SOCKS5 客户端/服务端、UDP relay、TLS、隧道池、CLI、Web UI | Rust |
 | `proxy-gui` | 桌面 GUI，负责拉起和管理同目录的 `proxy-core` | Windows / GPUI |
 | `proxy-mobile` | Android 本地 SOCKS5 客户端 | Tauri 2 + SvelteKit + Rust |
-| `dist` | 历史桌面包和发布产物 | Windows |
 
 ## 先读
 

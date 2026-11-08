@@ -15,7 +15,6 @@ rama_proxy/
 ├─ proxy-core/        Rust 核心、客户端/服务端 CLI、SOCKS5、UDP、TLS、隧道池、Web UI
 ├─ proxy-gui/         Windows 桌面 GUI（GPUI，不是 Tauri）
 ├─ proxy-mobile/      Android 客户端（Tauri 2 + SvelteKit + Rust）
-├─ dist/              历史桌面包与发布产物
 ├─ Cargo.toml         Rust workspace
 └─ Cargo.lock         锁定 Rust 依赖
 ```
