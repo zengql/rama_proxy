@@ -232,6 +232,7 @@ impl ServerStatsRegistry {
                 "idle" => summary.idle_connections += 1,
                 "active-tcp" => summary.active_tcp_connections += 1,
                 "active-udp" => summary.active_udp_connections += 1,
+                "heartbeat" => summary.heartbeat_connections += 1,
                 _ => summary.handshake_connections += 1,
             }
             if item.in_use {
@@ -304,6 +305,8 @@ pub struct ServerStatsSummary {
     pub idle_connections: usize,
     pub active_tcp_connections: usize,
     pub active_udp_connections: usize,
+    #[serde(default)]
+    pub heartbeat_connections: usize,
     pub in_use_connections: usize,
     pub bytes_from_client: u64,
     pub bytes_from_target: u64,

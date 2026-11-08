@@ -1,5 +1,6 @@
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rama::{
@@ -19,27 +20,85 @@ use crate::{
     error::AppError,
     tls::build_client_tls_context,
     tunnel::{
-        TunnelPool, opcode_is_close, opcode_is_ping, opcode_is_pong, opcode_is_udp_packet,
-        resolve_client_id,
-        read_opcode, read_response, read_udp_packet, run_heartbeat, write_close, write_open_connect,
-        write_open_udp, write_ping, write_pong, write_udp_packet,
+        TunnelPool, TunnelPoolSnapshot, opcode_is_close, opcode_is_ping, opcode_is_pong,
+        opcode_is_udp_packet, read_opcode, read_response, read_udp_packet, resolve_client_id,
+        run_heartbeat, write_close, write_open_connect, write_open_udp, write_ping, write_pong,
+        write_udp_packet,
     },
 };
 
 const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_HEARTBEAT_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
 pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
-    let bind_ip = parse_bind_ip(&config.socks5.bind)?;
-    let listen_addr = SocketAddr::new(bind_ip, config.socks5.port);
-    let listener = bind_listener(listen_addr).await?;
-    let tls = build_client_tls_context(&config.tls)?;
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    run_with_shutdown(config, shutdown_rx).await
+}
 
-    let pool = TunnelPool::new(&config.client, tls)?;
-    pool.spawn_maintainer();
+/// Runs the local SOCKS5 client service until `shutdown` receives `true` or
+/// its sender is dropped. This entry point is intended for embedded clients
+/// such as the Tauri mobile application.
+pub async fn run_with_shutdown(
+    config: ClientConfigFile,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    run_with_shutdown_ready(config, shutdown, None).await
+}
+
+/// Like [`run_with_shutdown`], but reports the bound SOCKS5 address once all
+/// startup work has completed. The caller can use this to avoid exposing a
+/// running state before the port is actually available.
+pub async fn run_with_shutdown_ready(
+    config: ClientConfigFile,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    ready: Option<tokio::sync::oneshot::Sender<Result<SocketAddr, String>>>,
+) -> Result<(), AppError> {
+    run_with_shutdown_ready_and_pool_stats(config, shutdown, ready, None).await
+}
+
+/// Like [`run_with_shutdown_ready`], and periodically publishes a tunnel pool
+/// snapshot for embedded clients that expose diagnostics in their UI.
+pub async fn run_with_shutdown_ready_and_pool_stats(
+    config: ClientConfigFile,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ready: Option<tokio::sync::oneshot::Sender<Result<SocketAddr, String>>>,
+    pool_stats: Option<tokio::sync::watch::Sender<Option<TunnelPoolSnapshot>>>,
+) -> Result<(), AppError> {
+    let prepared = async {
+        let bind_ip = parse_bind_ip(&config.socks5.bind)?;
+        let listen_addr = SocketAddr::new(bind_ip, config.socks5.port);
+        let listener = bind_listener(listen_addr).await?;
+        let tls = build_client_tls_context(&config.tls)?;
+        let pool = TunnelPool::new(&config.client, tls)?;
+        Ok::<_, AppError>((listen_addr, listener, pool))
+    }
+    .await;
+
+    let (listen_addr, listener, pool, ready) = match prepared {
+        Ok((listen_addr, listener, pool)) => (listen_addr, listener, pool, ready),
+        Err(err) => {
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(err.to_string()));
+            }
+            return Err(err);
+        }
+    };
+
+    let maintainer = pool.spawn_maintainer();
+    let stats_sender = pool_stats.clone();
+    let stats_task = pool_stats.map(|sender| {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = sender.send(Some(pool.snapshot().await));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    });
     let heartbeat_config = config.clone();
-    tokio::spawn(async move {
+    let heartbeat = tokio::spawn(async move {
         let server_addr = match heartbeat_config.client.server_addr.parse() {
             Ok(addr) => addr,
             Err(err) => {
@@ -49,14 +108,18 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
         };
         loop {
             let result = match build_client_tls_context(&heartbeat_config.tls) {
-                Ok(tls) => run_heartbeat(
-                    server_addr,
-                    &heartbeat_config.client.shared_secret,
-                    &resolve_client_id(&heartbeat_config.client.client_id),
-                    Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
-                    tls,
-                )
-                .await,
+                Ok(tls) => {
+                    run_heartbeat(
+                        server_addr,
+                        &heartbeat_config.client.shared_secret,
+                        &resolve_client_id(&heartbeat_config.client.client_id),
+                        Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
+                        tls,
+                        NEXT_HEARTBEAT_ID.fetch_add(1, Ordering::Relaxed),
+                        Duration::from_secs(heartbeat_config.client.heartbeat_timeout_secs.max(1)),
+                    )
+                    .await
+                }
                 Err(err) => Err(err),
             };
             match result {
@@ -82,20 +145,62 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
         "client socks5 listener started"
     );
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let socket = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(config.socks5.tcp_keepalive_secs.max(1)));
-        socket.set_tcp_keepalive(&keepalive)?;
-        let config = config.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, peer, &config, &pool).await {
-                warn!(client = %peer, error = %err, "local socks5 session ended with error");
-            }
-        });
+    tokio::task::yield_now().await;
+    if let Some(ready) = ready {
+        let _ = ready.send(Ok(listen_addr));
     }
+
+    let mut sessions = tokio::task::JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(()) if !*shutdown.borrow() => continue,
+                    _ => break Ok(()),
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(connection) => connection,
+                    Err(err) => break Err(AppError::from(err)),
+                };
+                let socket = socket2::SockRef::from(&stream);
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(config.socks5.tcp_keepalive_secs.max(1)));
+                if let Err(err) = socket.set_tcp_keepalive(&keepalive) {
+                    warn!(client = %peer, error = %err, "failed to configure socks5 keepalive");
+                }
+                let config = config.clone();
+                let pool = pool.clone();
+                sessions.spawn(async move {
+                    if let Err(err) = handle_client(stream, peer, &config, &pool).await {
+                        warn!(client = %peer, error = %err, "local socks5 session ended with error");
+                    }
+                });
+            }
+            joined = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(err)) = joined {
+                    warn!(error = %err, "local socks5 session task failed");
+                }
+            }
+        }
+    };
+
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+    maintainer.abort();
+    heartbeat.abort();
+    if let Some(stats_task) = stats_task {
+        stats_task.abort();
+        let _ = stats_task.await;
+    }
+    let _ = maintainer.await;
+    let _ = heartbeat.await;
+    if let Some(sender) = stats_sender {
+        let _ = sender.send(None);
+    }
+    info!(bind = %listen_addr, "client socks5 listener stopped");
+    result
 }
 
 async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, AppError> {

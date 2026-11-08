@@ -2,17 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use rama::tls::rustls::{
-    dep::{
-        rustls::{
-            self, RootCertStore, ServerConfig,
-            pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
-            server::WebPkiClientVerifier,
-        },
-        tokio_rustls::{self, TlsAcceptor, TlsConnector},
-    },
-    server::TlsAcceptorDataBuilder,
+use rustls::{
+    self, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
+    server::WebPkiClientVerifier,
 };
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
     config::{ClientTlsConfig, ServerTlsConfig},
@@ -56,7 +51,7 @@ pub fn build_client_tls_context(
         server_name,
         server_name_display: config.server_name.clone(),
         client_auth_configured,
-        backend: "rustls",
+        backend: "rustls-ring",
     }))
 }
 
@@ -69,26 +64,24 @@ pub fn build_server_tls_acceptor(
 
     let certs = load_certificates(&config.cert_path)?;
     let key = load_private_key(&config.key_path)?;
+    let builder = ServerConfig::builder();
     let server_config = if config.require_client_auth {
         let root_store = load_root_store(&config.client_ca_cert_path)?;
         let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
             .build()
             .map_err(|err| AppError::Boxed(format!("build client verifier failed: {err}")))?;
-        ServerConfig::builder()
+        builder
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
             .map_err(|err| AppError::Boxed(format!("build server tls config failed: {err}")))?
     } else {
-        TlsAcceptorDataBuilder::new(certs, key)
-            .map_err(|err| {
-                AppError::Boxed(format!("build server tls acceptor data failed: {err}"))
-            })?
-            .into_rustls_config()
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|err| AppError::Boxed(format!("build server tls config failed: {err}")))?
     };
 
-    Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(
-        server_config,
-    ))))
+    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
 
 fn client_auth_material(

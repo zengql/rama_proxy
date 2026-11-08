@@ -23,15 +23,15 @@ use crate::{
     server_stats::{ServerStatsRegistry, spawn_stats_server},
     tls::{ServerTlsAcceptor, build_server_tls_acceptor},
     tunnel::{
-        opcode_is_close, opcode_is_connect, opcode_is_heartbeat_open,
-        opcode_is_ping, opcode_is_pong,
-        opcode_is_udp, opcode_is_udp_packet, read_connect_target, read_opcode, read_udp_packet,
-        server_handshake, status_connect_failed, status_resolve_failed, write_close, write_ping,
-        read_heartbeat, write_heartbeat, write_pong, write_response, write_udp_packet,
+        opcode_is_close, opcode_is_connect, opcode_is_heartbeat_open, opcode_is_ping,
+        opcode_is_pong, opcode_is_udp, opcode_is_udp_packet, read_connect_target, read_heartbeat,
+        read_opcode, read_udp_packet, server_handshake, status_connect_failed,
+        status_resolve_failed, write_close, write_heartbeat, write_ping, write_pong,
+        write_response, write_udp_packet,
     },
 };
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -85,12 +85,19 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
                 continue;
             }
         };
-    tokio::spawn(async move {
-        if let Err(err) =
-            handle_connection(stream, peer, config, tls_acceptor, stats.clone(), handshake_permit).await
-        {
-            warn!(client = %peer, error = %err, "tunnel connection ended with error");
-        }
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection(
+                stream,
+                peer,
+                config,
+                tls_acceptor,
+                stats.clone(),
+                handshake_permit,
+            )
+            .await
+            {
+                debug!(client = %peer, error = %err, "tunnel connection task ended");
+            }
         });
     }
 }
@@ -148,6 +155,12 @@ async fn handle_connection(
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
     let connection_id = stats.register_connection(peer.to_string()).await;
+    let started_at = Instant::now();
+    info!(
+        connection_id,
+        client = %peer,
+        "tunnel connection accepted"
+    );
     let close_rx = stats.subscribe_close();
 
     let result = match tls_acceptor {
@@ -164,6 +177,11 @@ async fn handle_connection(
                 AppError::Boxed("tls handshake timed out".to_string())
             })?
             .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
+            info!(
+                connection_id,
+                client = %peer,
+                "tls handshake completed"
+            );
             handle_connection_io(
                 &mut stream,
                 peer,
@@ -189,6 +207,22 @@ async fn handle_connection(
             .await
         }
     };
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => info!(
+            connection_id,
+            client = %peer,
+            duration_ms,
+            "tunnel connection closed"
+        ),
+        Err(err) => warn!(
+            connection_id,
+            client = %peer,
+            duration_ms,
+            error = %err,
+            "tunnel connection closed with error"
+        ),
+    }
     stats.remove_connection(connection_id).await;
     result
 }
@@ -227,7 +261,12 @@ where
     drop(handshake_permit);
     stats.set_client_id(connection_id, client_id.clone()).await;
     stats.mark_idle(connection_id).await;
-    debug!(client = %peer, client_id = %client_id, "tunnel client authenticated");
+    info!(
+        connection_id,
+        client = %peer,
+        client_id = %client_id,
+        "tunnel client authenticated"
+    );
 
     loop {
         let opcode = tokio::select! {
@@ -242,7 +281,8 @@ where
             }
         };
         if opcode_is_heartbeat_open(opcode) {
-            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id).await;
+            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id)
+                .await;
         }
         if opcode_is_ping(opcode) {
             stats.touch(connection_id).await;
@@ -254,7 +294,16 @@ where
             stats
                 .mark_active_tcp(connection_id, target.to_string())
                 .await;
-            return serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id, close_rx).await;
+            return serve_tcp_tunnel(
+                stream,
+                peer,
+                target,
+                &config,
+                stats,
+                connection_id,
+                close_rx,
+            )
+            .await;
         }
         if opcode_is_udp(opcode) {
             stats.mark_active_udp(connection_id).await;
@@ -283,10 +332,24 @@ where
             stats.close_connection(previous_id);
         }
     }
+    info!(
+        connection_id,
+        client = %peer,
+        client_id = %client_id,
+        "heartbeat control channel established"
+    );
     let interval = Duration::from_secs(config.server.heartbeat_interval_secs.max(1));
     let timeout = Duration::from_secs(config.server.heartbeat_timeout_secs.max(1));
     loop {
         let ids = stats.client_tunnel_ids(&client_id).await;
+        info!(
+            connection_id,
+            client = %peer,
+            client_id = %client_id,
+            tunnel_count = ids.len(),
+            tunnel_ids = ?ids,
+            "heartbeat tunnel snapshot sent"
+        );
         write_heartbeat(stream, &ids).await?;
         let (opcode, ack_ids) = tokio::time::timeout(timeout, read_heartbeat(stream))
             .await
@@ -300,8 +363,10 @@ where
             .iter()
             .filter(|id| **id != connection_id && !ids.contains(id))
         {
-            debug!(
+            warn!(
+                connection_id,
                 client = %peer,
+                client_id = %client_id,
                 channel_id = *id,
                 "heartbeat reported an invalid channel id; closing that channel"
             );
@@ -310,15 +375,19 @@ where
                 .await
             {
                 debug!(
+                    connection_id,
                     client = %peer,
+                    client_id = %client_id,
                     channel_id = *id,
                     "heartbeat reported a channel that was already closed; ignoring"
                 );
             }
         }
         if ack_ids.len() != ids.len() {
-            debug!(
+            warn!(
+                connection_id,
                 client = %peer,
+                client_id = %client_id,
                 expected_channels = ids.len(),
                 reported_channels = ack_ids.len(),
                 "heartbeat channel list differs from server snapshot"
