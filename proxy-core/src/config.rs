@@ -563,7 +563,7 @@ fn default_tcp_keepalive_secs() -> u64 {
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
-    30
+    60
 }
 
 fn default_heartbeat_timeout_secs() -> u64 {
@@ -630,7 +630,7 @@ handshake_timeout_secs = 10
 max_handshakes = 1024
 udp_idle_timeout_secs = 300
 tcp_keepalive_secs = 60
-heartbeat_interval_secs = 30
+heartbeat_interval_secs = 60
 heartbeat_timeout_secs = 10
 
 [auth]
@@ -660,7 +660,7 @@ shared_secret = "change-me"
 client_id = ""
 pool_size = 8
 connect_timeout_secs = 10
-heartbeat_interval_secs = 30
+heartbeat_interval_secs = 60
 heartbeat_timeout_secs = 10
 
 [socks5]

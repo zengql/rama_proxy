@@ -16,12 +16,15 @@ import android.util.Log
 class ProxyForegroundService : Service() {
   private var wakeLock: PowerManager.WakeLock? = null
   private var wifiLock: WifiManager.WifiLock? = null
+  // Written on the main thread, read from the plugin bridge thread in setTrafficActive().
+  @Volatile
   private var systemRestartPending: Boolean = false
 
   override fun onCreate() {
     super.onCreate()
     Log.i(TAG, "foreground service onCreate")
     createNotificationChannel()
+    instance = this
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -49,33 +52,9 @@ class ProxyForegroundService : Service() {
       startForeground(NOTIFICATION_ID, notification)
     }
 
-    if (wakeLock == null) {
-      val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-      wakeLock = powerManager.newWakeLock(
-        PowerManager.PARTIAL_WAKE_LOCK,
-        "$packageName:rama-proxy"
-      ).apply {
-        setReferenceCounted(false)
-        acquire()
-      }
-      Log.i(TAG, "partial wake lock acquired")
-    }
-
-    if (wifiLock == null) {
-      val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
-      wifiLock = wifiManager
-        ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:rama-proxy-wifi")
-        ?.apply {
-          setReferenceCounted(false)
-          acquire()
-        }
-      if (wifiLock != null) {
-        Log.i(TAG, "high performance wifi lock acquired")
-      } else {
-        Log.w(TAG, "high performance wifi lock unavailable")
-      }
-    }
-
+    // Locks are no longer held for the whole service lifetime. They follow
+    // proxy traffic so the device can sleep while the proxy is idle.
+    applyTrafficLocks(trafficActive && !systemRestartPending)
     updateRunning(
       true,
       systemRestartPending,
@@ -86,22 +65,56 @@ class ProxyForegroundService : Service() {
     return START_STICKY
   }
 
+  @Synchronized
+  private fun applyTrafficLocks(active: Boolean) {
+    if (active) {
+      val lock = wakeLock ?: (getSystemService(POWER_SERVICE) as PowerManager)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:rama-proxy")
+        .apply { setReferenceCounted(false) }
+        .also { wakeLock = it }
+      val wasHeld = lock.isHeld
+      // Re-acquiring a non reference counted lock resets the safety timeout.
+      lock.acquire(WAKE_LOCK_TIMEOUT_MS)
+      if (!wasHeld) Log.i(TAG, "partial wake lock acquired for proxy traffic")
+
+      if (wifiLock == null) {
+        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+        wifiLock = wifiManager
+          ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:rama-proxy-wifi")
+          ?.apply { setReferenceCounted(false) }
+      }
+      wifiLock?.let { wifi ->
+        if (!wifi.isHeld) {
+          wifi.acquire()
+          Log.i(TAG, "high performance wifi lock acquired for proxy traffic")
+        }
+      }
+    } else {
+      wakeLock?.let { lock ->
+        if (lock.isHeld) {
+          lock.release()
+          Log.i(TAG, "partial wake lock released; proxy is idle")
+        }
+      }
+      wifiLock?.let { wifi ->
+        if (wifi.isHeld) {
+          wifi.release()
+          Log.i(TAG, "high performance wifi lock released; proxy is idle")
+        }
+      }
+    }
+    // Only lock flags here; service running/restart state is owned by onStartCommand/onDestroy.
+    wakeLockActive = wakeLock?.isHeld == true
+    wifiLockActive = wifiLock?.isHeld == true
+  }
+
   override fun onDestroy() {
+    instance = null
+    trafficActive = false
+    applyTrafficLocks(false)
     updateRunning(false, false, false, false)
     Log.i(TAG, "foreground service onDestroy")
-    wakeLock?.let { lock ->
-      if (lock.isHeld) {
-        lock.release()
-        Log.i(TAG, "partial wake lock released")
-      }
-    }
     wakeLock = null
-    wifiLock?.let { lock ->
-      if (lock.isHeld) {
-        lock.release()
-        Log.i(TAG, "high performance wifi lock released")
-      }
-    }
     wifiLock = null
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
       stopForeground(STOP_FOREGROUND_REMOVE)
@@ -154,7 +167,7 @@ class ProxyForegroundService : Service() {
         if (systemRestartPending) {
           "Android restarted the service; open the app to restore the local SOCKS5 proxy"
         } else {
-          "Local SOCKS5 service, wake lock, and Wi-Fi lock are active"
+          "Local SOCKS5 service is active; device sleep is allowed while idle"
         }
       )
       .setContentIntent(pendingIntent)
@@ -168,6 +181,22 @@ class ProxyForegroundService : Service() {
     private const val TAG = "RamaProxy"
     private const val CHANNEL_ID = "rama_proxy_local_socks5"
     private const val NOTIFICATION_ID = 2001
+    // Safety net: Rust refreshes the lock well before this while traffic continues.
+    private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
+
+    @Volatile
+    private var instance: ProxyForegroundService? = null
+
+    @Volatile
+    private var trafficActive: Boolean = false
+
+    /** Called by the plugin when Rust reports proxy traffic starting or stopping. */
+    fun setTrafficActive(active: Boolean) {
+      trafficActive = active
+      instance?.let { service ->
+        service.applyTrafficLocks(active && !service.systemRestartPending)
+      }
+    }
 
     @Volatile
     private var running: Boolean = false

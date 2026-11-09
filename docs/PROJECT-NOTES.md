@@ -118,9 +118,13 @@ tls connect failed
 
 - `android:stopWithTask="false"`：从最近任务划掉应用不会主动停止服务。
 - `START_STICKY`：进程被系统终止后允许 Android 重建 Kotlin 前台服务。
-- `PARTIAL_WAKE_LOCK`：降低睡眠时 CPU 被挂起的概率。
-- `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：降低睡眠时 Wi-Fi 被关闭的概率。
-- 通知渠道和电池优化豁免入口。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按流量持有**。连接池 `active > 0` 时立即申请；活动连接归零并持续 30 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
+  - “有流量”按连接池租约数 `active` 判断，不是按字节流动判断。经代理的长连接（WebSocket、SSH、浏览器 keep-alive 等）只要不断开，锁就一直持有，这种情况下系统仍可能提示耗电；这是为保证长连接下行数据能及时处理而有意保留的行为。
+  - 释放锁后 Wi-Fi 进入省电模式，空闲后首个请求的延迟会略增，属于预期代价。
+- 空闲隧道的复用校验使用墙钟时间：`Instant` 在 Android 挂起期间不计时，长时间睡眠后的空闲隧道会在复用前先 ping 探测，失效则丢弃并新建。
+- 心跳由服务端推送，默认间隔 60 秒；客户端等待下一次心跳的超时为 `heartbeat_interval_secs + heartbeat_timeout_secs`。服务端与客户端的 `heartbeat_interval_secs` 应保持一致或客户端更大。
+- 通知渠道和电池优化豁免入口。**必须**将应用加入电池优化白名单：白名单应用在 Doze 下保留网络访问，否则 Doze 会切断后台网络。即使在白名单内，设备挂起时收到的 TCP 包能否唤醒设备取决于芯片和厂商实现，不作保证。实际表现是：空闲睡眠后，首个请求可能要先探测或重新建立隧道，会多一些延迟，但不会直接失败。
+- 进程内的 tokio 定时器（连接池维护、统计推送、心跳重连）不会把设备从挂起中唤醒，只在设备醒着时运行。
 
 这些措施不能绕过小米、华为、OPPO、vivo 等设备的厂商省电策略。需要允许应用自启动、后台运行，并关闭针对本应用的电池优化限制。
 
@@ -129,7 +133,8 @@ tls connect failed
 - `START_STICKY` 只能让 Android 重建 Kotlin 前台服务，不能重新创建 Rust/Tauri 运行时。
 - 当前自动恢复逻辑会在应用下次启动或回到前台时，根据 `resume.intent` 检测上次运行状态并尝试重启本地 SOCKS5。
 - 如果整个进程已被厂商杀掉，必须重新打开应用，或在系统后台策略中彻底放行应用。
-- 前台服务状态、WakeLock、Wi-Fi Lock 可能因系统重建而变化，界面会显示当前状态和 `foregroundServiceError`。
+- 前台服务状态、WakeLock、Wi-Fi Lock 可能因系统重建而变化，界面会显示当前状态和 `foregroundServiceError`。WakeLock / Wi-Fi Lock 还会随流量变化，空闲时显示“未持有”属于正常状态。
+- 升级到 60 秒心跳时，需要手动修改已部署服务端（及桌面客户端）配置中的 `heartbeat_interval_secs = 60`；代码默认值只对未显式配置的文件生效。移动端每次启动使用代码默认值，不受影响。
 
 ## 6. 日志和日志上限
 

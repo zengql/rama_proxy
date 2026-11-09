@@ -26,6 +26,13 @@ const CA_CERT_FILE: &str = "ca.pem";
 const MAX_CA_CERT_BYTES: usize = 512 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Keep the wake/Wi-Fi locks this long after the last proxied connection closes.
+#[cfg(target_os = "android")]
+const TRAFFIC_LOCK_RELEASE_DELAY: Duration = Duration::from_secs(30);
+/// Re-send "active" this often so the Android-side 10 minute lock timeout never expires
+/// mid-traffic; leaves room for several failed bridge calls before the timeout.
+#[cfg(target_os = "android")]
+const TRAFFIC_LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
 const MAX_LOG_LINES: usize = 1_000;
 const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -454,6 +461,63 @@ async fn query_foreground_service_status(
     Ok(ForegroundServiceStatus::default())
 }
 
+/// Holds the Android wake/Wi-Fi locks only while proxied connections are active,
+/// so the device may sleep when the proxy is idle. Ends when the runtime drops its stats sender.
+#[cfg(target_os = "android")]
+async fn drive_traffic_locks(
+    app: tauri::AppHandle,
+    mut pool_stats: watch::Receiver<Option<TunnelPoolSnapshot>>,
+) {
+    // Lock state Kotlin last confirmed; `None` after a failed call, which forces a resend.
+    let mut confirmed = Some(false);
+    let mut last_busy: Option<std::time::Instant> = None;
+    let mut last_sent = std::time::Instant::now();
+    while pool_stats.changed().await.is_ok() {
+        let now = std::time::Instant::now();
+        if pool_stats
+            .borrow_and_update()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.active > 0)
+        {
+            last_busy = Some(now);
+        }
+        // Decided by traffic only; `confirmed` is used just to suppress duplicate calls.
+        let want = last_busy.is_some_and(|at| now.duration_since(at) < TRAFFIC_LOCK_RELEASE_DELAY);
+        let refresh_due = want && now.duration_since(last_sent) >= TRAFFIC_LOCK_REFRESH_INTERVAL;
+        if confirmed == Some(want) && !refresh_due {
+            continue;
+        }
+        confirmed = set_traffic_locks(&app, want).await.then_some(want);
+        last_sent = now;
+    }
+    // Runtime is gone (normal stop or abnormal exit): never leave the locks to the timeout.
+    if confirmed != Some(false) {
+        set_traffic_locks(&app, false).await;
+    }
+}
+
+/// Asks the Android foreground service to hold or release the traffic locks; returns success.
+#[cfg(target_os = "android")]
+async fn set_traffic_locks(app: &tauri::AppHandle, active: bool) -> bool {
+    let handle = app.state::<ForegroundPluginHandle>().0.clone();
+    match handle
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "setTrafficActive",
+            serde_json::json!({ "active": active }),
+        )
+        .await
+    {
+        Ok(_) => {
+            info!(active, "proxy traffic locks updated");
+            true
+        }
+        Err(err) => {
+            warn!(active, error = %err, "failed to update proxy traffic locks");
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 async fn wait_for_foreground_service(
     app: &tauri::AppHandle,
@@ -768,6 +832,9 @@ async fn start_client(
     let (pool_stats_tx, pool_stats_rx) = watch::channel::<Option<TunnelPoolSnapshot>>(None);
     let task_state = state.service.clone();
     let task_app = app.clone();
+
+    #[cfg(target_os = "android")]
+    tauri::async_runtime::spawn(drive_traffic_locks(app.clone(), pool_stats_rx.clone()));
 
     let task = tauri::async_runtime::spawn(async move {
         let result = proxy_core::client_runtime::run_with_shutdown_ready_and_pool_stats(

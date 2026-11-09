@@ -9,10 +9,16 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+
+@InvokeArg
+class TrafficActiveArgs {
+  var active: Boolean = false
+}
 
 @TauriPlugin
 class ProxyForegroundPlugin(private val activity: Activity) : Plugin(activity) {
@@ -49,6 +55,17 @@ class ProxyForegroundPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Failed to stop foreground service")
+    }
+  }
+
+  @Command
+  fun setTrafficActive(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(TrafficActiveArgs::class.java)
+      ProxyForegroundService.setTrafficActive(args.active)
+      invoke.resolve()
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Failed to update proxy traffic locks")
     }
   }
 

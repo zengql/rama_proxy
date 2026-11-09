@@ -697,7 +697,7 @@
 
       {#if status.processId}
         <p class="service-note">
-          PID {status.processId} · WakeLock {status.wakeLockHeld ? "已持有" : "未持有"} · Wi-Fi Lock {status.wifiLockHeld ? "已持有" : "未持有"}
+          PID {status.processId} · WakeLock {status.wakeLockHeld ? "已持有" : "未持有"} · Wi-Fi Lock {status.wifiLockHeld ? "已持有" : "未持有"}（仅有代理连接时持有，空闲允许睡眠）
         </p>
       {/if}
 

@@ -322,9 +322,11 @@ tls connect failed
 
 - `android:stopWithTask="false"`，从最近任务中划掉应用时不会主动停止服务。
 - `START_STICKY`，进程被系统终止后允许 Android 重新创建 Kotlin 前台服务。
-- `PARTIAL_WAKE_LOCK`，降低睡眠时 CPU 被挂起的概率。
-- `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock，降低睡眠时 Wi-Fi 被关闭的概率。
-- 通知渠道和电池优化豁免入口。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按流量持有**：有代理连接时申请，连接全部结束 30 秒后释放；空闲时允许手机睡眠，避免系统提示“阻止睡眠 / 耗电异常”。经代理的长连接不断开时锁会一直持有。
+- 通知渠道和电池优化豁免入口。必须加入电池优化白名单，否则 Doze 下后台网络会被切断。
+- 睡眠后首个请求会先探测空闲隧道，失效则重建，可能多一些延迟。
+
+界面中 `WakeLock 未持有` 在空闲时属于正常状态。细节见 [项目注意事项与运维手册](../docs/PROJECT-NOTES.md) 第 5 节。
 
 这些措施不能绕过设备厂商的省电策略。小米、华为、OPPO、vivo 等系统仍可能杀掉进程；还需要在系统设置中允许自启动、后台运行，并关闭针对本应用的电池优化限制。
 

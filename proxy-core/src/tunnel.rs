@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rama::net::address::{Host, HostWithPort};
 use serde::Serialize;
@@ -49,7 +49,10 @@ const MAX_REFILL_BACKOFF: Duration = Duration::from_secs(30);
 struct IdleTunnel {
     tunnel_id: u64,
     stream: TunnelStream,
-    verified_at: Instant,
+    // Wall clock on purpose: `Instant` (CLOCK_MONOTONIC) stops while an Android
+    // device is suspended, so a tunnel idle across a long sleep would look fresh
+    // and be reused without a probe even though NAT/server may have dropped it.
+    verified_at: SystemTime,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,10 +337,14 @@ impl TunnelPool {
                 break;
             };
 
-            if idle_tunnel.verified_at.elapsed() >= IDLE_TUNNEL_HEALTHY_FOR {
+            if idle_tunnel
+                .verified_at
+                .elapsed()
+                .map_or(true, |age| age >= IDLE_TUNNEL_HEALTHY_FOR)
+            {
                 match probe_idle_tunnel(&mut idle_tunnel.stream).await {
                     Ok(()) => {
-                        idle_tunnel.verified_at = Instant::now();
+                        idle_tunnel.verified_at = SystemTime::now();
                     }
                     Err(err) => {
                         stale_count += 1;
@@ -450,14 +457,18 @@ impl TunnelPool {
             .fetch_add(drained.len(), Ordering::SeqCst);
 
         for mut idle_tunnel in drained {
-            if idle_tunnel.verified_at.elapsed() < IDLE_TUNNEL_HEALTHY_FOR {
+            if idle_tunnel
+                .verified_at
+                .elapsed()
+                .is_ok_and(|age| age < IDLE_TUNNEL_HEALTHY_FOR)
+            {
                 self.return_idle_tunnel(idle_tunnel).await;
                 continue;
             }
 
             match probe_idle_tunnel(&mut idle_tunnel.stream).await {
                 Ok(()) => {
-                    idle_tunnel.verified_at = Instant::now();
+                    idle_tunnel.verified_at = SystemTime::now();
                     debug!(
                         tunnel_id = idle_tunnel.tunnel_id,
                         "idle tunnel probe succeeded"
@@ -495,7 +506,7 @@ impl IdleTunnel {
         Self {
             tunnel_id,
             stream,
-            verified_at: Instant::now(),
+            verified_at: SystemTime::now(),
         }
     }
 }

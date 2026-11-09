@@ -116,7 +116,13 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
                         Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
                         tls,
                         NEXT_HEARTBEAT_ID.fetch_add(1, Ordering::Relaxed),
-                        Duration::from_secs(heartbeat_config.client.heartbeat_timeout_secs.max(1)),
+                        // The server pushes one heartbeat per interval, so waiting only
+                        // `heartbeat_timeout_secs` between pushes would drop and redial the
+                        // channel every cycle. Allow a full interval plus the timeout.
+                        Duration::from_secs(
+                            heartbeat_config.client.heartbeat_interval_secs.max(1)
+                                + heartbeat_config.client.heartbeat_timeout_secs.max(1),
+                        ),
                     )
                     .await
                 }
