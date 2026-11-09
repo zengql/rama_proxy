@@ -2,6 +2,19 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Release 1.4.1
+
+Patch release focused on Android battery usage and reconnect behavior:
+
+- Android holds the partial wake lock and Wi-Fi lock only while proxied
+  connections are active, so the device can sleep when the proxy is idle.
+- Idle tunnel freshness uses the wall clock, so tunnels left idle across device
+  suspend are probed before reuse.
+- The client heartbeat read timeout is `heartbeat_interval_secs +
+  heartbeat_timeout_secs`; the default heartbeat interval is now 60 seconds.
+
+The Android release is version `1.4.1` with `versionCode` `1401`.
+
 ## Release 1.4.0
 
 This release adds the Android local SOCKS5 client and the core capabilities it

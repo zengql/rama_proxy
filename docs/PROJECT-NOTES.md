@@ -1,8 +1,8 @@
 # Rama Proxy 项目注意事项与运维手册
 
-- 文档更新时间：2026-11-08
+- 文档更新时间：2026-11-09
 - 适用范围：仓库根目录、`proxy-core`、`proxy-gui`、`proxy-mobile`
-- Android 当前版本：`1.4.0`，版本号 `1400`
+- Android 当前版本：`1.4.1`，版本号 `1401`
 - Android Release 包名：`com.zqliang.ramaproxy`
 - Android Debug 包名：`com.zqliang.ramaproxy.debug`
 
@@ -499,7 +499,7 @@ E:\project\rust\rama_proxy\Cargo.lock
 - `versionCode` 单调递增，不能回退。
 - `package-lock.json` 顶层和 `packages[""].version` 与 `package.json` 一致。
 - `Cargo.lock` 中 `rama-proxy-mobile` 的版本与移动端 `Cargo.toml` 一致。
-- 根 `Cargo.toml` 的 `workspace.package.version` 当前是 `1.4.0`；移动端 `Cargo.toml`、`tauri.conf.json`、`package.json` 和 `package-lock.json` 也必须保持 `1.4.0`。
+- 根 `Cargo.toml` 的 `workspace.package.version` 当前是 `1.4.1`；移动端 `Cargo.toml`、`tauri.conf.json`、`package.json` 和 `package-lock.json` 也必须保持 `1.4.1`，Android `versionCode` 为 `1401`。
 - 不要提交 `local.properties`、`keystore.properties`、`*.jks`、`*.keystore` 或密码。
 - Release APK 必须签名并通过 `apksigner verify`。
 - 发布前用同一证书和更高 `versionCode` 构建升级包。

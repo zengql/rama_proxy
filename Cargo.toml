@@ -3,5 +3,5 @@ resolver = "3"
 members = ["proxy-core", "proxy-gui", "proxy-mobile/src-tauri"]
 
 [workspace.package]
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
