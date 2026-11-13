@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "android")]
+use jni::objects::{GlobalRef, JObject, JString, JValue};
+#[cfg(target_os = "android")]
+use jni::sys::{jboolean, JNI_FALSE, JNI_TRUE};
+#[cfg(target_os = "android")]
+use jni::{JNIEnv, JavaVM};
 use proxy_core::config::ClientConfigFile;
 use proxy_core::tunnel::TunnelPoolSnapshot;
 use rustls::pki_types::{pem::PemObject, CertificateDer};
@@ -49,6 +55,21 @@ struct LogRecord {
 static LOG_BUFFER: OnceLock<StdMutex<VecDeque<LogRecord>>> = OnceLock::new();
 static LOG_FILE_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
 static LOG_FILE_IO_LOCK: StdMutex<()> = StdMutex::new(());
+static SERVICE_STATE: OnceLock<Arc<Mutex<ServiceState>>> = OnceLock::new();
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "android")]
+static ANDROID_JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+#[cfg(target_os = "android")]
+static ANDROID_SERVICE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
+fn shared_service_state() -> &'static Arc<Mutex<ServiceState>> {
+    SERVICE_STATE.get_or_init(|| Arc::new(Mutex::new(ServiceState::default())))
+}
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 fn log_buffer() -> &'static StdMutex<VecDeque<LogRecord>> {
     LOG_BUFFER.get_or_init(|| StdMutex::new(VecDeque::with_capacity(MAX_LOG_LINES)))
@@ -315,6 +336,7 @@ struct ClientStatus {
     last_error: Option<String>,
     pool_stats: Option<TunnelPoolSnapshot>,
     foreground_service_running: bool,
+    foreground_service_restoring: bool,
     foreground_service_error: Option<String>,
     system_restarted: bool,
     battery_optimization_ignored: bool,
@@ -356,16 +378,24 @@ struct ServiceState {
     foreground_service_error: Option<String>,
 }
 
-#[derive(Default)]
 struct AppState {
     service: Arc<Mutex<ServiceState>>,
-    next_generation: AtomicU64,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            service: shared_service_state().clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct ForegroundServiceStatus {
     running: bool,
     system_restarted: bool,
+    restore_in_progress: bool,
+    restore_error: Option<String>,
     battery_optimization_ignored: bool,
     wake_lock_held: bool,
     wifi_lock_held: bool,
@@ -439,6 +469,14 @@ async fn query_foreground_service_status(
             .get("systemRestarted")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        restore_in_progress: value
+            .get("restoreInProgress")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        restore_error: value
+            .get("restoreError")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
         battery_optimization_ignored: value
             .get("batteryOptimizationIgnored")
             .and_then(serde_json::Value::as_bool)
@@ -461,11 +499,157 @@ async fn query_foreground_service_status(
     Ok(ForegroundServiceStatus::default())
 }
 
+#[cfg(target_os = "android")]
+fn call_android_foreground_static(
+    method: &str,
+    signature: &str,
+    args: &[JValue<'_, '_>],
+) -> Result<(), String> {
+    let vm = ANDROID_JAVA_VM
+        .get()
+        .ok_or_else(|| "Android JavaVM is not initialized".to_string())?;
+    let class = ANDROID_SERVICE_CLASS
+        .get()
+        .ok_or_else(|| "Android foreground service class is not initialized".to_string())?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|err| format!("failed to attach Android JNI thread: {err}"))?;
+    env.call_static_method(class, method, signature, args)
+        .map(|_| ())
+        .map_err(|err| format!("failed to call ProxyForegroundService.{method}: {err}"))
+}
+
+#[cfg(target_os = "android")]
+fn initialize_android_bridge(env: &mut JNIEnv<'_>, service: &JObject<'_>) -> Result<(), String> {
+    let vm = env
+        .get_java_vm()
+        .map_err(|err| format!("failed to get Android JavaVM: {err}"))?;
+    let class = env
+        .get_object_class(service)
+        .map_err(|err| format!("failed to get Android foreground service class: {err}"))?;
+    let class = env
+        .new_global_ref(class)
+        .map_err(|err| format!("failed to retain Android foreground service class: {err}"))?;
+
+    let _ = ANDROID_JAVA_VM.set(vm);
+    let _ = ANDROID_SERVICE_CLASS.set(class);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn notify_android_runtime_stopped() {
+    if let Err(err) = call_android_foreground_static("onRuntimeStoppedFromRust", "()V", &[]) {
+        warn!(error = %err, "failed to notify Android foreground service that the runtime stopped");
+    }
+}
+
+#[cfg(target_os = "android")]
+fn notify_android_restore_result(success: bool, message: &str) {
+    let result = (|| -> Result<(), String> {
+        let vm = ANDROID_JAVA_VM
+            .get()
+            .ok_or_else(|| "Android JavaVM is not initialized".to_string())?;
+        let class = ANDROID_SERVICE_CLASS
+            .get()
+            .ok_or_else(|| "Android foreground service class is not initialized".to_string())?;
+        let mut env = vm
+            .attach_current_thread()
+            .map_err(|err| format!("failed to attach Android JNI thread: {err}"))?;
+        let message = env
+            .new_string(message)
+            .map_err(|err| format!("failed to create Android restore message: {err}"))?;
+        env.call_static_method(
+            class,
+            "onRuntimeRestoreResultFromRust",
+            "(ZLjava/lang/String;)V",
+            &[
+                JValue::Bool(success as jboolean),
+                JValue::Object(message.as_ref()),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("failed to report Android restore result: {err}"))
+    })();
+
+    if let Err(err) = result {
+        warn!(error = %err, "failed to report Android runtime restore result");
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn restore_runtime_from_android(data_dir: String) -> Result<String, String> {
+    let data_dir = PathBuf::from(data_dir);
+
+    init_tracing();
+    if let Err(err) = initialize_log_file(data_dir.join(LOG_FILE)) {
+        eprintln!("failed to initialize Android restore log file: {err}");
+    }
+
+    let marker = data_dir.join(RESUME_MARKER_FILE);
+    if !marker.is_file() {
+        return Err("automatic resume marker is missing".to_string());
+    }
+
+    let config_path = data_dir.join(CONFIG_FILE);
+    let config = ClientConfigFile::from_path(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    info!(
+        data_dir = %data_dir.display(),
+        "restoring local SOCKS5 runtime from Android foreground service"
+    );
+    start_runtime(shared_service_state().clone(), config, None).await
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_zqliang_ramaproxy_ProxyForegroundService_nativeRuntimeBridge(
+    mut env: JNIEnv<'_>,
+    service: JObject<'_>,
+    data_dir: JString<'_>,
+    restore: jboolean,
+) -> jboolean {
+    let result = (|| -> Result<(), String> {
+        initialize_android_bridge(&mut env, &service)?;
+
+        if restore != JNI_TRUE {
+            return Ok(());
+        }
+
+        let data_dir: String = env
+            .get_string(&data_dir)
+            .map_err(|err| format!("failed to read Android data directory: {err}"))?
+            .into();
+
+        tauri::async_runtime::spawn(async move {
+            let result = restore_runtime_from_android(data_dir).await;
+            match &result {
+                Ok(bind) => info!(bind, "Android runtime restored from foreground service"),
+                Err(err) => warn!(error = %err, "Android runtime restore failed"),
+            }
+            let message = result
+                .as_deref()
+                .unwrap_or("failed to restore the local SOCKS5 listener");
+            notify_android_restore_result(result.is_ok(), message);
+        });
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => JNI_TRUE,
+        Err(err) => {
+            warn!(error = %err, "failed to initialize Android runtime bridge");
+            JNI_FALSE
+        }
+    }
+}
+
 /// Holds the Android wake/Wi-Fi locks only while proxied connections are active,
 /// so the device may sleep when the proxy is idle. Ends when the runtime drops its stats sender.
 #[cfg(target_os = "android")]
 async fn drive_traffic_locks(
-    app: tauri::AppHandle,
+    app: Option<tauri::AppHandle>,
     mut pool_stats: watch::Receiver<Option<TunnelPoolSnapshot>>,
 ) {
     // Lock state Kotlin last confirmed; `None` after a failed call, which forces a resend.
@@ -487,27 +671,38 @@ async fn drive_traffic_locks(
         if confirmed == Some(want) && !refresh_due {
             continue;
         }
-        confirmed = set_traffic_locks(&app, want).await.then_some(want);
+        confirmed = set_traffic_locks(app.as_ref(), want).await.then_some(want);
         last_sent = now;
     }
     // Runtime is gone (normal stop or abnormal exit): never leave the locks to the timeout.
     if confirmed != Some(false) {
-        set_traffic_locks(&app, false).await;
+        set_traffic_locks(app.as_ref(), false).await;
     }
 }
 
 /// Asks the Android foreground service to hold or release the traffic locks; returns success.
 #[cfg(target_os = "android")]
-async fn set_traffic_locks(app: &tauri::AppHandle, active: bool) -> bool {
-    let handle = app.state::<ForegroundPluginHandle>().0.clone();
-    match handle
-        .run_mobile_plugin_async::<serde_json::Value>(
-            "setTrafficActive",
-            serde_json::json!({ "active": active }),
+async fn set_traffic_locks(app: Option<&tauri::AppHandle>, active: bool) -> bool {
+    let result = if let Some(app) = app {
+        let handle = app.state::<ForegroundPluginHandle>().0.clone();
+        handle
+            .run_mobile_plugin_async::<serde_json::Value>(
+                "setTrafficActive",
+                serde_json::json!({ "active": active }),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    } else {
+        call_android_foreground_static(
+            "setTrafficActiveFromRust",
+            "(Z)V",
+            &[JValue::Bool(active as u8)],
         )
-        .await
-    {
-        Ok(_) => {
+    };
+
+    match result {
+        Ok(()) => {
             info!(active, "proxy traffic locks updated");
             true
         }
@@ -659,6 +854,7 @@ async fn status_from_state(state: &AppState, app: &tauri::AppHandle) -> ClientSt
     };
     let (
         foreground_service_running,
+        foreground_service_restoring,
         system_restarted,
         battery_optimization_ignored,
         wake_lock_held,
@@ -667,13 +863,14 @@ async fn status_from_state(state: &AppState, app: &tauri::AppHandle) -> ClientSt
     ) = match query_foreground_service_status(app).await {
         Ok(status) => (
             status.running,
+            status.restore_in_progress,
             status.system_restarted,
             status.battery_optimization_ignored,
             status.wake_lock_held,
             status.wifi_lock_held,
-            stored_error,
+            stored_error.or(status.restore_error),
         ),
-        Err(err) => (false, false, false, false, false, Some(err)),
+        Err(err) => (false, false, false, false, false, false, Some(err)),
     };
 
     ClientStatus {
@@ -685,6 +882,7 @@ async fn status_from_state(state: &AppState, app: &tauri::AppHandle) -> ClientSt
         last_error,
         pool_stats,
         foreground_service_running,
+        foreground_service_restoring,
         foreground_service_error,
         system_restarted,
         battery_optimization_ignored,
@@ -705,12 +903,6 @@ async fn take_runtime(state: &AppState, generation: u64) -> Option<ServiceRuntim
     } else {
         None
     }
-}
-
-async fn set_start_error(state: &AppState, message: String) {
-    let mut guard = state.service.lock().await;
-    guard.started_at = None;
-    guard.last_error = Some(message);
 }
 
 #[tauri::command]
@@ -798,27 +990,17 @@ async fn validate_config(settings: ClientSettings) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-#[tauri::command]
-async fn start_client(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-    settings: ClientSettings,
-) -> Result<ClientStatus, String> {
-    let already_running = {
-        let guard = state.service.lock().await;
-        guard.runtime.is_some()
-    };
-    if already_running {
-        return Ok(status_from_state(&state, &app).await);
-    }
-
-    let config = settings.into_config();
+async fn start_runtime(
+    service: Arc<Mutex<ServiceState>>,
+    config: ClientConfigFile,
+    app: Option<tauri::AppHandle>,
+) -> Result<String, String> {
     let bind = local_bind(config.socks5.port);
     let server_addr = config.client.server_addr.clone();
 
     if let Err(err) = config.validate() {
         let message = err.to_string();
-        let mut guard = state.service.lock().await;
+        let mut guard = service.lock().await;
         guard.socks5_bind = bind;
         guard.server_addr = server_addr;
         guard.started_at = None;
@@ -826,11 +1008,19 @@ async fn start_client(
         return Err(message);
     }
 
-    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed);
+    // Keep this lock while waiting for the listener. A concurrent JNI restore and
+    // Tauri start therefore observe a single process-wide runtime instead of racing
+    // to bind the same SOCKS5 port twice.
+    let mut guard = service.lock().await;
+    if guard.runtime.is_some() {
+        return Ok(guard.socks5_bind.clone());
+    }
+
+    let generation = next_generation();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (pool_stats_tx, pool_stats_rx) = watch::channel::<Option<TunnelPoolSnapshot>>(None);
-    let task_state = state.service.clone();
+    let task_service = service.clone();
     let task_app = app.clone();
 
     #[cfg(target_os = "android")]
@@ -845,8 +1035,14 @@ async fn start_client(
         )
         .await;
 
-        let foreground_stop_error = stop_foreground_service(&task_app).await.err();
-        let mut guard = task_state.lock().await;
+        let foreground_stop_error = if let Some(app) = task_app.as_ref() {
+            stop_foreground_service(app).await.err()
+        } else {
+            #[cfg(target_os = "android")]
+            notify_android_runtime_stopped();
+            None
+        };
+        let mut guard = task_service.lock().await;
         if guard
             .runtime
             .as_ref()
@@ -862,19 +1058,16 @@ async fn start_client(
         }
     });
 
-    {
-        let mut guard = state.service.lock().await;
-        guard.runtime = Some(ServiceRuntime {
-            generation,
-            shutdown: shutdown_tx,
-            pool_stats: pool_stats_rx,
-            task,
-        });
-        guard.socks5_bind = bind;
-        guard.server_addr = server_addr;
-        guard.started_at = Some(unix_now());
-        guard.last_error = None;
-    }
+    guard.runtime = Some(ServiceRuntime {
+        generation,
+        shutdown: shutdown_tx,
+        pool_stats: pool_stats_rx,
+        task,
+    });
+    guard.socks5_bind = bind;
+    guard.server_addr = server_addr;
+    guard.started_at = None;
+    guard.last_error = None;
 
     let ready_result = tokio::time::timeout(START_TIMEOUT, ready_rx).await;
     let start_error = match ready_result {
@@ -888,13 +1081,30 @@ async fn start_client(
     };
 
     if let Some(err) = start_error {
-        if let Some(runtime) = take_runtime(&state, generation).await {
+        let runtime = guard.runtime.take();
+        drop(guard);
+        if let Some(runtime) = runtime {
             let _ = runtime.shutdown.send(true);
             let _ = tokio::time::timeout(STOP_TIMEOUT, runtime.task).await;
         }
-        set_start_error(&state, err.clone()).await;
+        let mut guard = service.lock().await;
+        guard.started_at = None;
+        guard.last_error = Some(err.clone());
         return Err(err);
     }
+
+    guard.started_at = Some(unix_now());
+    Ok(guard.socks5_bind.clone())
+}
+
+#[tauri::command]
+async fn start_client(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    settings: ClientSettings,
+) -> Result<ClientStatus, String> {
+    let config = settings.into_config();
+    start_runtime(state.service.clone(), config, Some(app.clone())).await?;
 
     let foreground_error = start_foreground_service(&app).await.err();
     if let Some(error) = foreground_error.as_deref() {

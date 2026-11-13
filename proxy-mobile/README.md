@@ -321,12 +321,21 @@ tls connect failed
 应用使用非 VPN 的 `specialUse` 前台服务维持本地 SOCKS5，不申请 `BIND_VPN_SERVICE`。服务配置包括：
 
 - `android:stopWithTask="false"`，从最近任务中划掉应用时不会主动停止服务。
-- `START_STICKY`，进程被系统终止后允许 Android 重新创建 Kotlin 前台服务。
+- `START_STICKY`，进程被系统终止后允许 Android 重新创建 Kotlin 前台服务；当服务收到空 `intent` 时，会加载 native 库并通过 JNI 自动恢复 Rust SOCKS5。
+- 自动恢复读取应用数据目录中的 `resume.intent`、`client.toml` 和 `rama-proxy.log`。恢复期间界面显示“恢复中”，失败时通过 `restoreError` 显示原因。
+- Tauri 启动与 JNI 恢复共享同一份 Rust runtime 状态，并串行执行，避免重复绑定本地端口。
 - `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按流量持有**：有代理连接时申请，连接全部结束 30 秒后释放；空闲时允许手机睡眠，避免系统提示“阻止睡眠 / 耗电异常”。经代理的长连接不断开时锁会一直持有。
 - 通知渠道和电池优化豁免入口。必须加入电池优化白名单，否则 Doze 下后台网络会被切断。
 - 睡眠后首个请求会先探测空闲隧道，失效则重建，可能多一些延迟。
 
 界面中 `WakeLock 未持有` 在空闲时属于正常状态。细节见 [项目注意事项与运维手册](../docs/PROJECT-NOTES.md) 第 5 节。
+
+恢复相关状态：
+
+- `systemRestarted`：当前前台服务是否为 Android 在无 `intent` 情况下重建。
+- `restoreInProgress`：Rust SOCKS5 自动恢复是否正在进行。
+- `restoreError`：自动恢复失败原因；此时打开应用或回到前台仍会触发兜底恢复。
+- `foregroundServiceRestoring`：前端用于避免与 Service 自动恢复竞争恢复任务。
 
 这些措施不能绕过设备厂商的省电策略。小米、华为、OPPO、vivo 等系统仍可能杀掉进程；还需要在系统设置中允许自启动、后台运行，并关闭针对本应用的电池优化限制。
 
@@ -343,7 +352,9 @@ $adb = 'D:\resp\android\platform-tools\adb.exe'
 - PID 和前台服务都在、连接池为 0：查看 `lastRefillError` 和 `consecutiveFailures`，通常是网络切换、TLS 或上游不可达。
 - 连接池存在但服务端连接消失：检查移动网络/Wi-Fi 切换，以及上游 NAT 的空闲超时；客户端会定期探测空闲隧道并补池。
 
-`START_STICKY` 只能让 Android 重建 Kotlin 服务，不能重新创建 Rust/Tauri 运行时。当前自动恢复逻辑会在应用下次打开或回到前台时，根据 `resume.intent` 重新启动 SOCKS5。因此，如果厂商在睡眠时杀掉了整个进程，需要在系统后台策略中放行应用，或重新打开应用恢复代理。
+`START_STICKY` 重建前台服务时，Service 会在 `intent == null` 的情况下通过 JNI 自动恢复 Rust SOCKS5；自动恢复期间界面显示“恢复中”，失败时显示 `restoreError`。打开应用或回到前台仍会基于 `resume.intent` 做兜底恢复。若系统强制停止应用、彻底禁止服务重建或厂商持续杀进程，仍需在系统后台策略中放行应用，或手动打开应用恢复代理。
+
+对应日志关键字：`foreground service restarted by Android without an intent; scheduling Rust runtime restore`、`restoring local SOCKS5 runtime from Android foreground service`、`Android runtime restored from foreground service`、`Android runtime restore failed`。
 
 ## 验证
 

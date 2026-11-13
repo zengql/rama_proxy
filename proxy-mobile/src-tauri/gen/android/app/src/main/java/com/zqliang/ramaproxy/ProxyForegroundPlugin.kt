@@ -75,6 +75,8 @@ class ProxyForegroundPlugin(private val activity: Activity) : Plugin(activity) {
       val result = JSObject()
       result.put("running", ProxyForegroundService.isRunning)
       result.put("systemRestarted", ProxyForegroundService.isSystemRestarted)
+      result.put("restoreInProgress", ProxyForegroundService.isRestoreInProgress)
+      result.put("restoreError", ProxyForegroundService.restoreErrorMessage)
       result.put("batteryOptimizationIgnored", isIgnoringBatteryOptimizations())
       result.put("wakeLockHeld", ProxyForegroundService.isWakeLockHeld)
       result.put("wifiLockHeld", ProxyForegroundService.isWifiLockHeld)

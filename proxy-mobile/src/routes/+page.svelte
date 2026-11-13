@@ -40,6 +40,7 @@
     poolStats: TunnelPoolStats | null;
     foregroundServiceRunning: boolean;
     foregroundServiceError: string | null;
+    foregroundServiceRestoring: boolean;
     systemRestarted: boolean;
     batteryOptimizationIgnored: boolean;
     wakeLockHeld: boolean;
@@ -82,6 +83,7 @@
     poolStats: null,
     foregroundServiceRunning: false,
     foregroundServiceError: null,
+    foregroundServiceRestoring: false,
     systemRestarted: false,
     batteryOptimizationIgnored: false,
     wakeLockHeld: false,
@@ -174,7 +176,14 @@
   }
 
   async function restoreIfNeeded(reason: string) {
-    if (!tauri || restoring || busy || !status.resumePending || status.running) return;
+    if (
+      !tauri ||
+      restoring ||
+      busy ||
+      !status.resumePending ||
+      status.running ||
+      status.foregroundServiceRestoring
+    ) return;
     restoring = true;
     message = `${reason}，检测到上次代理仍在运行，正在自动恢复本地 SOCKS5…`;
     try {
@@ -673,25 +682,36 @@
         <p class="empty-hint">启动代理后显示连接池实时状态。</p>
       {/if}
 
-      <div class:ok={status.foregroundServiceRunning} class="service-row">
+      <div
+        class:ok={status.foregroundServiceRunning || status.foregroundServiceRestoring}
+        class="service-row"
+      >
         <span class="dot"></span>
         <span>Android 前台服务</span>
         <strong>
-          {status.running
-            ? status.foregroundServiceRunning
-              ? '运行中'
-              : status.foregroundServiceError
-                ? '启动失败'
-                : '未启动'
-            : '未运行'}
+          {status.foregroundServiceRestoring
+            ? '恢复中'
+            : status.running
+              ? status.foregroundServiceRunning
+                ? '运行中'
+                : status.foregroundServiceError
+                  ? '启动失败'
+                  : '未启动'
+              : status.foregroundServiceRunning
+                ? '服务运行中，代理未恢复'
+                : status.foregroundServiceError
+                  ? '启动失败'
+                  : '未运行'}
         </strong>
       </div>
       {#if status.foregroundServiceError}
         <p class="service-error">{status.foregroundServiceError}</p>
       {/if}
-      {#if status.systemRestarted}
+      {#if status.foregroundServiceRestoring}
+        <p class="pool-warning">正在自动恢复本地 SOCKS5 服务…</p>
+      {:else if status.systemRestarted}
         <p class="pool-warning">
-          Android 已重新创建前台服务，但 Rust SOCKS5 不会由系统自动恢复。应用下次打开或回到前台时会尝试自动恢复。
+          Android 已重新创建前台服务，但本地 SOCKS5 自动恢复失败。打开应用后会再次尝试恢复。
         </p>
       {/if}
 

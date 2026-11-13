@@ -6507,7 +6507,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "clap",
  "rama",
@@ -6525,7 +6525,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-gui"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "embed-resource",
  "gpui-kit",
@@ -6837,8 +6837,9 @@ dependencies = [
 
 [[package]]
 name = "rama-proxy-mobile"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
+ "jni",
  "ndk-sys",
  "proxy-core",
  "rustls",

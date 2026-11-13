@@ -12,8 +12,11 @@ import android.os.IBinder
 import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Log
+import java.io.File
 
 class ProxyForegroundService : Service() {
+  private external fun nativeRuntimeBridge(dataDir: String, restore: Boolean): Boolean
+
   private var wakeLock: PowerManager.WakeLock? = null
   private var wifiLock: WifiManager.WifiLock? = null
   // Written on the main thread, read from the plugin bridge thread in setTrafficActive().
@@ -28,14 +31,19 @@ class ProxyForegroundService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    if (intent == null) {
+    val systemRestart = intent == null
+    if (systemRestart) {
       systemRestartPending = true
+      restoreInProgress = true
+      restoreError = null
       Log.w(
         TAG,
-        "foreground service restarted by Android without an intent; Rust proxy runtime is not restored automatically"
+        "foreground service restarted by Android without an intent; scheduling Rust runtime restore"
       )
     } else {
       systemRestartPending = false
+      restoreInProgress = false
+      restoreError = null
     }
     Log.i(
       TAG,
@@ -61,8 +69,76 @@ class ProxyForegroundService : Service() {
       wakeLock?.isHeld == true,
       wifiLock?.isHeld == true
     )
-    Log.i(TAG, "foreground service is running")
+
+    if (systemRestart) {
+      scheduleRuntimeRestore()
+    } else {
+      Log.i(TAG, "foreground service is running")
+    }
     return START_STICKY
+  }
+
+  private fun scheduleRuntimeRestore() {
+    val dataDir = applicationContext.dataDir.absolutePath
+    val marker = File(dataDir, RESUME_MARKER_FILE)
+    if (!marker.isFile) {
+      restoreInProgress = false
+      restoreError = "Automatic resume marker is missing; open Rama Proxy to start the proxy again"
+      systemRestartPending = true
+      updateRunning(
+        true,
+        true,
+        wakeLock?.isHeld == true,
+        wifiLock?.isHeld == true
+      )
+      updateNotificationIfNeeded()
+      Log.w(TAG, "automatic resume marker is missing at ${marker.absolutePath}")
+      return
+    }
+
+    restoreInProgress = true
+    restoreError = null
+    val scheduled = try {
+      ensureNativeLoaded() && nativeRuntimeBridge(dataDir, true)
+    } catch (error: Throwable) {
+      restoreError = "Unable to schedule native runtime restore: ${error.message}"
+      false
+    }
+
+    if (!scheduled) {
+      restoreInProgress = false
+      systemRestartPending = true
+      if (restoreError == null) {
+        restoreError = "Unable to schedule native runtime restore"
+      }
+      updateRunning(
+        true,
+        true,
+        wakeLock?.isHeld == true,
+        wifiLock?.isHeld == true
+      )
+      updateNotificationIfNeeded()
+      Log.w(TAG, restoreError ?: "Unable to schedule native runtime restore")
+    }
+  }
+
+  @Synchronized
+  private fun ensureNativeLoaded(): Boolean {
+    if (nativeLoaded) return true
+    return try {
+      System.loadLibrary("rama_proxy_mobile_lib")
+      nativeLoaded = true
+      true
+    } catch (error: Throwable) {
+      restoreError = "Unable to load native runtime: ${error.message}"
+      Log.e(TAG, "failed to load native runtime", error)
+      false
+    }
+  }
+
+  private fun updateNotificationIfNeeded() {
+    val manager = getSystemService(NotificationManager::class.java)
+    manager.notify(NOTIFICATION_ID, buildNotification())
   }
 
   @Synchronized
@@ -111,6 +187,7 @@ class ProxyForegroundService : Service() {
   override fun onDestroy() {
     instance = null
     trafficActive = false
+    restoreInProgress = false
     applyTrafficLocks(false)
     updateRunning(false, false, false, false)
     Log.i(TAG, "foreground service onDestroy")
@@ -158,18 +235,24 @@ class ProxyForegroundService : Service() {
       Notification.Builder(this)
     }
 
+    val title = when {
+      restoreInProgress -> "Rama Proxy is restoring"
+      systemRestartPending -> "Rama Proxy needs to be reopened"
+      else -> "Rama Proxy is running"
+    }
+    val content = when {
+      restoreInProgress -> "Restoring the local SOCKS5 listener automatically"
+      systemRestartPending -> {
+        restoreError
+          ?: "Android restarted the service; open the app to restore the local SOCKS5 proxy"
+      }
+      else -> "Local SOCKS5 service is active; device sleep is allowed while idle"
+    }
+
     return builder
       .setSmallIcon(R.mipmap.ic_launcher)
-      .setContentTitle(
-        if (systemRestartPending) "Rama Proxy needs to be reopened" else "Rama Proxy is running"
-      )
-      .setContentText(
-        if (systemRestartPending) {
-          "Android restarted the service; open the app to restore the local SOCKS5 proxy"
-        } else {
-          "Local SOCKS5 service is active; device sleep is allowed while idle"
-        }
-      )
+      .setContentTitle(title)
+      .setContentText(content)
       .setContentIntent(pendingIntent)
       .setCategory(Notification.CATEGORY_SERVICE)
       .setOnlyAlertOnce(true)
@@ -181,6 +264,7 @@ class ProxyForegroundService : Service() {
     private const val TAG = "RamaProxy"
     private const val CHANNEL_ID = "rama_proxy_local_socks5"
     private const val NOTIFICATION_ID = 2001
+    private const val RESUME_MARKER_FILE = "resume.intent"
     // Safety net: Rust refreshes the lock well before this while traffic continues.
     private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
 
@@ -190,12 +274,70 @@ class ProxyForegroundService : Service() {
     @Volatile
     private var trafficActive: Boolean = false
 
+    @Volatile
+    private var nativeLoaded: Boolean = false
+
+    @Volatile
+    private var restoreInProgress: Boolean = false
+
+    @Volatile
+    private var restoreError: String? = null
+
     /** Called by the plugin when Rust reports proxy traffic starting or stopping. */
     fun setTrafficActive(active: Boolean) {
       trafficActive = active
       instance?.let { service ->
         service.applyTrafficLocks(active && !service.systemRestartPending)
       }
+    }
+
+    @JvmStatic
+    fun setTrafficActiveFromRust(active: Boolean) {
+      setTrafficActive(active)
+    }
+
+    @JvmStatic
+    fun onRuntimeStoppedFromRust() {
+      trafficActive = false
+      val service = instance
+      if (service == null) {
+        updateRunning(false, false, false, false)
+        return
+      }
+      service.systemRestartPending = true
+      service.applyTrafficLocks(false)
+      updateRunning(
+        true,
+        true,
+        service.wakeLock?.isHeld == true,
+        service.wifiLock?.isHeld == true
+      )
+      service.updateNotificationIfNeeded()
+    }
+
+    @JvmStatic
+    fun onRuntimeRestoreResultFromRust(success: Boolean, message: String) {
+      restoreInProgress = false
+      restoreError = if (success) null else message.ifBlank {
+        "The local SOCKS5 listener could not be restored automatically"
+      }
+
+      val service = instance
+      if (service == null) {
+        updateRunning(false, false, false, false)
+        return
+      }
+
+      service.systemRestartPending = !success
+      if (!success) trafficActive = false
+      service.applyTrafficLocks(trafficActive && !service.systemRestartPending)
+      updateRunning(
+        true,
+        !success,
+        service.wakeLock?.isHeld == true,
+        service.wifiLock?.isHeld == true
+      )
+      service.updateNotificationIfNeeded()
     }
 
     @Volatile
@@ -221,6 +363,12 @@ class ProxyForegroundService : Service() {
 
     val isWifiLockHeld: Boolean
       get() = wifiLockActive
+
+    val isRestoreInProgress: Boolean
+      get() = restoreInProgress
+
+    val restoreErrorMessage: String?
+      get() = restoreError
 
     internal fun updateRunning(
       value: Boolean,

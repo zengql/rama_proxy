@@ -2,6 +2,20 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Release 1.4.2
+
+Patch release focused on Android foreground-service recovery:
+
+- When Android recreates the sticky foreground service with an empty intent, the
+  service restores the Rust SOCKS5 runtime through JNI instead of waiting for
+  the app UI to be reopened.
+- Restore shares the process-wide runtime state with Tauri and serializes
+  startup so concurrent paths cannot bind the local SOCKS5 port twice.
+- The client exposes restore progress and error state, while opening the app or
+  returning to the foreground remains a fallback recovery path.
+
+The Android release is version `1.4.2` with `versionCode` `1402`.
+
 ## Release 1.4.1
 
 Patch release focused on Android battery usage and reconnect behavior:

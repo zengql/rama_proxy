@@ -1,8 +1,8 @@
 # Rama Proxy 项目注意事项与运维手册
 
-- 文档更新时间：2026-11-09
+- 文档更新时间：2026-11-13
 - 适用范围：仓库根目录、`proxy-core`、`proxy-gui`、`proxy-mobile`
-- Android 当前版本：`1.4.1`，版本号 `1401`
+- Android 当前版本：`1.4.2`，版本号 `1402`
 - Android Release 包名：`com.zqliang.ramaproxy`
 - Android Debug 包名：`com.zqliang.ramaproxy.debug`
 
@@ -107,7 +107,7 @@ tls connect failed
 手机睡眠后连接全部消失时，不要先归因于 UDP。至少有三类原因：
 
 1. Android 或厂商省电策略杀掉了整个应用进程。
-2. 进程仍在，但 Kotlin 前台服务被系统重建，而 Rust/Tauri 运行时没有随之恢复。
+2. 进程仍在，但 Kotlin 前台服务被系统重建；如果自动恢复未完成或失败，Rust/Tauri 运行时和本地 SOCKS5 端口会暂时不存在。
 3. Wi-Fi/移动网络切换或上游 NAT 空闲超时，导致服务端侧已有连接消失。
 
 区分方法见“Android 后台运行与睡眠”和“设备诊断”章节。
@@ -118,6 +118,10 @@ tls connect failed
 
 - `android:stopWithTask="false"`：从最近任务划掉应用不会主动停止服务。
 - `START_STICKY`：进程被系统终止后允许 Android 重建 Kotlin 前台服务。
+- 前台服务在 `intent == null` 时识别为系统重建，并加载 native 库、调用 `nativeRuntimeBridge(dataDir, true)` 自动恢复 Rust SOCKS5；不再只重建 Kotlin 外壳。
+- 自动恢复会检查 `resume.intent`，再读取 `dataDir/client.toml`，重新初始化同名日志文件并启动 Rust runtime。
+- Tauri 命令和 JNI 恢复共用进程级 `SERVICE_STATE`；启动过程用互斥锁串行化，避免并发重复绑定 `127.0.0.1:1080`。
+- 恢复进度通过 `restoreInProgress` 暴露，失败原因通过 `restoreError` 返回；通知和界面会显示“恢复中”或需要重新打开应用。
 - `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按流量持有**。连接池 `active > 0` 时立即申请；活动连接归零并持续 30 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
   - “有流量”按连接池租约数 `active` 判断，不是按字节流动判断。经代理的长连接（WebSocket、SSH、浏览器 keep-alive 等）只要不断开，锁就一直持有，这种情况下系统仍可能提示耗电；这是为保证长连接下行数据能及时处理而有意保留的行为。
   - 释放锁后 Wi-Fi 进入省电模式，空闲后首个请求的延迟会略增，属于预期代价。
@@ -130,10 +134,11 @@ tls connect failed
 
 关键限制：
 
-- `START_STICKY` 只能让 Android 重建 Kotlin 前台服务，不能重新创建 Rust/Tauri 运行时。
-- 当前自动恢复逻辑会在应用下次启动或回到前台时，根据 `resume.intent` 检测上次运行状态并尝试重启本地 SOCKS5。
-- 如果整个进程已被厂商杀掉，必须重新打开应用，或在系统后台策略中彻底放行应用。
-- 前台服务状态、WakeLock、Wi-Fi Lock 可能因系统重建而变化，界面会显示当前状态和 `foregroundServiceError`。WakeLock / Wi-Fi Lock 还会随流量变化，空闲时显示“未持有”属于正常状态。
+- `START_STICKY` 能触发 Kotlin 前台服务重建；新 Service 会通过 JNI 自动恢复 Rust runtime，无需用户重新打开应用。
+- 自动恢复依赖 `resume.intent` 和有效 `client.toml`；标记或配置缺失、native 加载失败、SOCKS5 端口无法绑定时，界面显示 `restoreError`，打开应用或回到前台会再次尝试。
+- `START_STICKY` 不保证系统一定重建服务。若整个进程被厂商策略杀死、用户强制停止或系统禁止重建，仍需厂商保活或手动打开应用。
+- Tauri 与 JNI 恢复共享 runtime state 并串行启动，但不能修复上游网络、TLS 证书或服务端不可达等外部故障。
+- 前台服务状态、恢复状态、WakeLock、Wi-Fi Lock 可能因系统重建而变化，界面会显示 `foregroundServiceError`、`restoreInProgress`、`restoreError`。WakeLock / Wi-Fi Lock 还会随流量变化，空闲时显示“未持有”属于正常状态。
 - 升级到 60 秒心跳时，需要手动修改已部署服务端（及桌面客户端）配置中的 `heartbeat_interval_secs = 60`；代码默认值只对未显式配置的文件生效。移动端每次启动使用代码默认值，不受影响。
 
 ## 6. 日志和日志上限
@@ -426,7 +431,7 @@ $adb = 'D:\resp\android\platform-tools\adb.exe'
 - 有 PID、没有前台服务：Kotlin 前台服务生命周期异常，结合 Logcat 排查。
 - PID 和前台服务都在、连接池为 0：查看 `lastRefillError`、`consecutiveFailures`，通常是网络切换、TLS、证书或上游不可达。
 - 连接池存在但服务端连接消失：检查 Wi-Fi/移动网络切换和上游 NAT 空闲超时；客户端会定期探测空闲隧道并补池。
-- Kotlin 服务被 `START_STICKY` 重建但 SOCKS5 未恢复：Rust/Tauri 运行时不会由系统自动创建，重新打开应用触发恢复。
+- Kotlin 服务被 `START_STICKY` 重建后，先看 `restoreInProgress`、`restoreError` 和日志；正常会自动恢复 Rust SOCKS5，若标记、配置、native 库或端口绑定失败，则重新打开应用触发兜底恢复。
 
 查看日志：
 
@@ -499,11 +504,13 @@ E:\project\rust\rama_proxy\Cargo.lock
 - `versionCode` 单调递增，不能回退。
 - `package-lock.json` 顶层和 `packages[""].version` 与 `package.json` 一致。
 - `Cargo.lock` 中 `rama-proxy-mobile` 的版本与移动端 `Cargo.toml` 一致。
-- 根 `Cargo.toml` 的 `workspace.package.version` 当前是 `1.4.1`；移动端 `Cargo.toml`、`tauri.conf.json`、`package.json` 和 `package-lock.json` 也必须保持 `1.4.1`，Android `versionCode` 为 `1401`。
+- 根 `Cargo.toml` 的 `workspace.package.version`、移动端 `Cargo.toml`、`tauri.conf.json`、`package.json` 和 `package-lock.json` 必须保持 `1.4.2`，Android `versionCode` 为 `1402`。
 - 不要提交 `local.properties`、`keystore.properties`、`*.jks`、`*.keystore` 或密码。
 - Release APK 必须签名并通过 `apksigner verify`。
 - 发布前用同一证书和更高 `versionCode` 构建升级包。
 - 发布前检查 `BIND_VPN_SERVICE` 不存在。
+- 发布前检查 `ProxyForegroundService.nativeRuntimeBridge` 和 Rust JNI 导出名在 R8 后未被移除，原生库中存在 `Java_com_zqliang_ramaproxy_ProxyForegroundService_nativeRuntimeBridge` 符号。
+- 发布前在目标真机验证 `START_STICKY` 重建：服务收到空 `intent` 后自动恢复 `127.0.0.1:1080`，界面经历“恢复中”后回到运行状态。
 - 发布前检查 arm64 原生库、16 KB 页对齐和 SHA-256。
 
 v1.4.0 已将根 workspace、移动端 Rust/Tauri、`package.json` 和 `package-lock.json` 统一为 `1.4.0`，Android `versionCode` 为 `1400`。
@@ -527,6 +534,18 @@ v1.4.0 已将根 workspace、移动端 Rust/Tauri、`package.json` 和 `package-
 - 曾在 Android 17（API 37、16 KB 页）的 `sdk_gphone16k_x86_64` 模拟器验证前端加载、本地监听 `127.0.0.1:1080`、SOCKS5 `05 00` 握手及四种 ABI 的 `0x4000` 对齐。
 - 本次文档更新时没有连接 Android 真机；真机睡眠和厂商保活行为仍需在目标机型上验证。
 
+2026-11-13 的 v1.4.2 分支验证结果（版本号提升前）：
+
+- `cargo fmt --all -- --check` 通过。
+- `cargo check -p rama-proxy-mobile` 通过。
+- `npm run check` 通过，0 个错误、0 个警告。
+- `cargo check --target aarch64-linux-android -p rama-proxy-mobile` 通过。
+- Android Debug 和 Release 完整构建成功；Release 经 R8 后保留 JNI 方法和 Rust 回调，原生库保留 JNI 导出符号。
+- 版本号提升前的验证 APK：`1.4.1` / `versionCode 1401`，大小 `40,423,129` 字节，SHA-256 `14E7562E0028F9C6196C4C368AA12F1B5D18DC0BB89602D3810A2820BEAD6E86`。
+- 验证 APK 的 v2 签名通过，签名证书 SHA-256 为 `b8845c1581fd8588f7b56b07f955940bcdf32d196138d48dd1074b64bef0fd0d`。
+- 本次未连接 Android 真机，`START_STICKY` 重建后的真实自动恢复仍需在目标机型上验证。
+- 版本号已提升为 `1.4.2` / `1402`；按本次要求没有重新打包，因此上述 APK 不是最终 v1.4.2 发布包。
+
 ## 17. 已知限制
 
 - Android 端不提供 VPN/VpnService，不能自动接管全系统流量。
@@ -534,7 +553,8 @@ v1.4.0 已将根 workspace、移动端 Rust/Tauri、`package.json` 和 `package-
 - UDP 依赖上游 server 的 UDP relay，且不支持 SOCKS5 UDP 分片。
 - TLS 只支持 PEM CA 信任导入；移动端当前不支持客户端证书/私钥。
 - Android 厂商省电策略可能杀掉进程；前台服务、WakeLock 和 Wi-Fi Lock 不能保证进程永不被杀。
-- `START_STICKY` 不会自动恢复 Rust/Tauri 运行时，需要用户重新打开应用触发恢复。
+- `START_STICKY` 自动恢复只覆盖 Android 重建前台服务的场景；系统强制停止、厂商禁止重建或持续杀进程时，服务可能不再被拉起，仍需手动打开应用或调整保活策略。
+- 自动恢复失败时需检查 `resume.intent`、`client.toml`、日志目录权限、native 库加载和 `1080` 端口绑定；界面通过 `restoreError` 显示原因。
 - 日志采用有界内存和有界磁盘轮转，不适合作为长期审计存储。
 - Release 使用 R8/minify；如果新增依赖依赖反射或 JNI 命名，需要同步检查 ProGuard 规则。
 - Release 升级必须保持签名证书不变；丢失 keystore 后不能覆盖升级已有安装。
@@ -549,6 +569,7 @@ v1.4.0 已将根 workspace、移动端 Rust/Tauri、`package.json` 和 `package-
 - UDP 支持范围、分片策略或上游协议变化。
 - TCP 池预热、心跳、补池或诊断字段变化。
 - Android 前台服务、WakeLock、电池优化或自动恢复逻辑变化。
+- JNI 方法名、回调签名、`resume.intent` 标记语义或 Sticky Service 自动恢复流程变化。
 - TLS 证书格式、路径、大小限制或客户端证书支持变化。
 - 包名、版本号、签名配置、ABI、SDK/NDK 或构建命令变化。
 - 新增会被用户误判为故障的行为。
