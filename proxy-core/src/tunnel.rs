@@ -5,13 +5,13 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rama::net::address::{Host, HostWithPort};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
@@ -40,8 +40,13 @@ const STATUS_CONNECT_FAILED: u8 = 0x03;
 const STATUS_RESOLVE_FAILED: u8 = 0x04;
 const STATUS_CLIENT_ID_REQUIRED: u8 = 0x05;
 const IDLE_TUNNEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const IDLE_TUNNEL_HEALTHY_FOR: Duration = Duration::from_secs(15);
-const POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_TUNNEL_HEALTHY_FOR: Duration = Duration::from_secs(120);
+const POOL_MAINTENANCE_INTERVAL_FAST: Duration = Duration::from_secs(1);
+const POOL_MAINTENANCE_INTERVAL_SLOW: Duration = Duration::from_secs(30);
+/// After this long with zero proxy traffic, pause background idle tunnel probing
+/// so the radio and CPU can stay asleep until the next request arrives.
+const POOL_DEEP_IDLE_AFTER: Duration = Duration::from_secs(3 * 60);
+const POOL_MAINTENANCE_INTERVAL_DEEP_IDLE: Duration = Duration::from_secs(5 * 60);
 const MAINTENANCE_SWEEP_BATCH: usize = 8;
 const MAX_STALE_TUNNELS_PER_ACQUIRE: usize = 2;
 const MAX_REFILL_BACKOFF: Duration = Duration::from_secs(30);
@@ -55,7 +60,7 @@ struct IdleTunnel {
     verified_at: SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelPoolSnapshot {
     pub max_idle_size: usize,
@@ -64,6 +69,7 @@ pub struct TunnelPoolSnapshot {
     pub inspecting_idle: usize,
     pub connecting: usize,
     pub active: usize,
+    pub last_traffic_age_secs: Option<u64>,
     pub consecutive_failures: usize,
     pub next_refill_allowed_in_secs: Option<u64>,
     pub created_total: usize,
@@ -97,6 +103,8 @@ pub struct TunnelPool {
     inspecting_idle: Arc<AtomicUsize>,
     connecting: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
+    last_traffic_unix_ms: Arc<AtomicU64>,
+    state_notify: Arc<Notify>,
     next_tunnel_id: Arc<AtomicU64>,
     refill_state: Arc<Mutex<RefillState>>,
     tls: Option<ClientTlsContext>,
@@ -111,6 +119,15 @@ pub type TunnelStream = Box<dyn TunnelIo>;
 pub struct TunnelLease {
     inner: TunnelStream,
     active: Arc<AtomicUsize>,
+    last_traffic_unix_ms: Arc<AtomicU64>,
+    state_notify: Arc<Notify>,
+}
+
+fn unix_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl TunnelPool {
@@ -134,21 +151,83 @@ impl TunnelPool {
             inspecting_idle: Arc::new(AtomicUsize::new(0)),
             connecting: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
+            last_traffic_unix_ms: Arc::new(AtomicU64::new(0)),
+            state_notify: Arc::new(Notify::new()),
             next_tunnel_id: Arc::new(AtomicU64::new(1)),
             refill_state: Arc::new(Mutex::new(RefillState::default())),
             tls,
         })
     }
 
+    pub fn state_notify(&self) -> Arc<Notify> {
+        self.state_notify.clone()
+    }
+
+    fn is_deep_idle(&self) -> bool {
+        if self.active.load(Ordering::Relaxed) > 0 {
+            return false;
+        }
+        let last_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
+        if last_ms == 0 {
+            return false;
+        }
+        let elapsed_ms = unix_now_millis().saturating_sub(last_ms);
+        elapsed_ms >= POOL_DEEP_IDLE_AFTER.as_millis() as u64
+    }
+
     pub fn spawn_maintainer(&self) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
-                this.reap_idle_tunnels().await;
-                this.schedule_refill().await;
-                tokio::time::sleep(POOL_MAINTENANCE_INTERVAL).await;
+                // In deep idle (no proxy traffic for >= 3 minutes) while the pool is already full,
+                // skip active network ping probes so the radio and CPU can stay in deep sleep.
+                // Any stale tunnel will be probed lazily on the next `acquire()`.
+                if !(this.is_deep_idle() && this.idle_len() >= this.warm_idle_target) {
+                    this.reap_idle_tunnels().await;
+                    this.schedule_refill().await;
+                }
+                let interval = this.pick_maintenance_interval().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = this.state_notify.notified(), if interval > POOL_MAINTENANCE_INTERVAL_SLOW => {}
+                }
             }
         })
+    }
+
+    /// Chooses the next maintenance sleep duration based on pool state so the
+    /// maintainer backs off when everything is healthy, saving CPU and battery.
+    async fn pick_maintenance_interval(&self) -> Duration {
+        let idle = self.idle_len();
+        let inspecting = self.inspecting_idle.load(Ordering::Relaxed);
+        let connecting = self.connecting.load(Ordering::Relaxed);
+        let in_flight = inspecting.saturating_add(connecting);
+
+        // If refill is backing off, honor the backoff cooldown
+        {
+            let refill_state = self.refill_state.lock().await;
+            if let Some(next_allowed_at) = refill_state.next_allowed_at {
+                let now = Instant::now();
+                if next_allowed_at > now {
+                    let remaining = next_allowed_at.duration_since(now);
+                    return remaining.clamp(
+                        POOL_MAINTENANCE_INTERVAL_FAST,
+                        POOL_MAINTENANCE_INTERVAL_SLOW,
+                    );
+                }
+            }
+        }
+
+        // Pool is below the warm target or refills/probes are running — stay fast.
+        if idle.saturating_add(in_flight) < self.warm_idle_target || in_flight > 0 {
+            return POOL_MAINTENANCE_INTERVAL_FAST;
+        }
+
+        if self.is_deep_idle() {
+            return POOL_MAINTENANCE_INTERVAL_DEEP_IDLE;
+        }
+
+        POOL_MAINTENANCE_INTERVAL_SLOW
     }
 
     fn idle_len(&self) -> usize {
@@ -167,6 +246,9 @@ impl TunnelPool {
                     .saturating_add(999)
                     .saturating_div(1_000) as u64
             });
+        let last_traffic_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
+        let last_traffic_age_secs = (last_traffic_ms > 0)
+            .then(|| unix_now_millis().saturating_sub(last_traffic_ms) / 1_000);
 
         TunnelPoolSnapshot {
             max_idle_size: self.max_idle_size,
@@ -175,6 +257,7 @@ impl TunnelPool {
             inspecting_idle: self.inspecting_idle.load(Ordering::Relaxed),
             connecting: self.connecting.load(Ordering::Relaxed),
             active: self.active.load(Ordering::Relaxed),
+            last_traffic_age_secs,
             consecutive_failures: refill_state.consecutive_failures,
             next_refill_allowed_in_secs,
             created_total: refill_state.created_total,
@@ -254,6 +337,7 @@ impl TunnelPool {
         let client_id = self.client_id.clone();
         let connect_timeout = self.connect_timeout;
         let connecting = self.connecting.clone();
+        let state_notify = self.state_notify.clone();
         let refill_state = self.refill_state.clone();
         let tls = self.tls.clone();
         let tls_backend = tls.as_ref().map(|tls| tls.backend).unwrap_or("plain");
@@ -303,11 +387,13 @@ impl TunnelPool {
                         connecting.fetch_sub(1, Ordering::SeqCst);
                         info!(tunnel_id, "idle tunnel added to pool");
                     }
+                    state_notify.notify_waiters();
                 }
                 Err(err) => {
                     connecting.fetch_sub(1, Ordering::SeqCst);
                     let (failures, backoff_secs) =
                         register_refill_failure(&refill_state, &err.to_string()).await;
+                    state_notify.notify_waiters();
                     warn!(
                         tunnel_id,
                         server_addr = %server_addr,
@@ -324,6 +410,13 @@ impl TunnelPool {
                 }
             }
         });
+    }
+
+    fn record_traffic_start(&self) {
+        self.last_traffic_unix_ms
+            .store(unix_now_millis(), Ordering::Relaxed);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        self.state_notify.notify_waiters();
     }
 
     pub async fn acquire(&self) -> Result<TunnelLease, AppError> {
@@ -375,11 +468,13 @@ impl TunnelPool {
                 tunnel_id = idle_tunnel.tunnel_id,
                 idle_remaining, "reusing verified pooled tunnel"
             );
-            self.active.fetch_add(1, Ordering::SeqCst);
+            self.record_traffic_start();
             self.schedule_refill().await;
             return Ok(TunnelLease {
                 inner: idle_tunnel.stream,
                 active: self.active.clone(),
+                last_traffic_unix_ms: self.last_traffic_unix_ms.clone(),
+                state_notify: self.state_notify.clone(),
             });
         }
 
@@ -410,6 +505,7 @@ impl TunnelPool {
             Err(err) => {
                 let (failures, backoff_secs) =
                     register_refill_failure(&self.refill_state, &err.to_string()).await;
+                self.state_notify.notify_waiters();
                 warn!(
                     tunnel_id,
                     server_addr = %self.server_addr,
@@ -434,10 +530,12 @@ impl TunnelPool {
                 return Err(err);
             }
         };
-        self.active.fetch_add(1, Ordering::SeqCst);
+        self.record_traffic_start();
         Ok(TunnelLease {
             inner: stream,
             active: self.active.clone(),
+            last_traffic_unix_ms: self.last_traffic_unix_ms.clone(),
+            state_notify: self.state_notify.clone(),
         })
     }
 
@@ -542,9 +640,17 @@ async fn probe_idle_tunnel(stream: &mut TunnelStream) -> Result<(), AppError> {
     .map_err(|_| AppError::InvalidConfig("idle tunnel probe timed out".to_string()))?
 }
 
+impl TunnelLease {
+    fn touch_traffic(&self) {
+        self.last_traffic_unix_ms
+            .store(unix_now_millis(), Ordering::Relaxed);
+    }
+}
+
 impl Drop for TunnelLease {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
+        self.state_notify.notify_waiters();
     }
 }
 
@@ -554,7 +660,12 @@ impl AsyncRead for TunnelLease {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if matches!(&poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.touch_traffic();
+        }
+        poll
     }
 }
 
@@ -564,7 +675,11 @@ impl AsyncWrite for TunnelLease {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut *self.inner).poll_write(cx, buf)
+        let poll = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if matches!(&poll, Poll::Ready(Ok(n)) if *n > 0) {
+            self.touch_traffic();
+        }
+        poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

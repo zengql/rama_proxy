@@ -13,7 +13,7 @@ use tokio::{
     io::copy,
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{ClientConfigFile, UserConfig},
@@ -30,6 +30,9 @@ use crate::{
 const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Close idle TCP relay streams after this long with zero data transfer in either
+/// direction so abandoned HTTP keep-alive sockets do not hold tunnel leases indefinitely.
+const TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 static NEXT_HEARTBEAT_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
 pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
@@ -90,10 +93,36 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
     let stats_sender = pool_stats.clone();
     let stats_task = pool_stats.map(|sender| {
         let pool = pool.clone();
+        let notify = pool.state_notify();
         tokio::spawn(async move {
             loop {
-                let _ = sender.send(Some(pool.snapshot().await));
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let snapshot = pool.snapshot().await;
+                let is_active = snapshot.active > 0;
+                let has_recent_traffic = snapshot.last_traffic_age_secs.is_some_and(|age| age < 35);
+                let has_backoff = snapshot.next_refill_allowed_in_secs.is_some();
+                sender.send_if_modified(|current| {
+                    if current.as_ref() != Some(&snapshot) {
+                        *current = Some(snapshot);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                // Event-driven wakeup on tunnel state changes, with a low-power fallback timer:
+                // - 2s while traffic is actively flowing or cooling down so lock release is prompt
+                // - 5s during refill backoff so countdown UI updates
+                // - 30s when completely idle so the CPU/Tokio runtime stays asleep
+                let interval = if is_active || has_recent_traffic {
+                    Duration::from_secs(2)
+                } else if has_backoff {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(30)
+                };
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(interval) => {}
+                }
             }
         })
     });
@@ -226,7 +255,7 @@ async fn handle_client(
     pool: &TunnelPool,
 ) -> Result<(), AppError> {
     stream.set_nodelay(true)?;
-    info!(client = %peer, "accepted local socks5 session");
+    debug!(client = %peer, "accepted local socks5 session");
 
     let header = tokio::time::timeout(
         SOCKS_HANDSHAKE_TIMEOUT,
@@ -260,7 +289,7 @@ async fn handle_client(
     .await
     .map_err(|_| AppError::Boxed(format!("read socks5 request timed out for {peer}")))?
     .map_err(|err| AppError::Boxed(format!("read socks5 request failed: {err}")))?;
-    info!(client = %peer, command = ?request.command, destination = %request.destination, "received socks5 request");
+    debug!(client = %peer, command = ?request.command, destination = %request.destination, "received socks5 request");
 
     match request.command {
         Command::Connect => serve_connect(stream, peer, request.destination, pool).await,
@@ -365,7 +394,7 @@ async fn serve_connect(
             .await?;
         return Err(err);
     }
-    info!(client = %peer, destination = %destination, "tcp tunnel connected");
+    debug!(client = %peer, destination = %destination, "tcp tunnel connected");
 
     server::Reply::new(HostWithPort::default_ipv4(0))
         .write_to(&mut stream)
@@ -378,10 +407,19 @@ async fn serve_connect(
             local_to_tunnel.map(|up_bytes| (up_bytes, 0)),
         tunnel_to_local = copy(&mut tunnel_reader, &mut local_writer) =>
             tunnel_to_local.map(|down_bytes| (0, down_bytes)),
+        _ = wait_for_tcp_relay_idle(pool) => {
+            debug!(
+                client = %peer,
+                destination = %destination,
+                idle_timeout_secs = TCP_RELAY_IDLE_TIMEOUT.as_secs(),
+                "closing idle tcp socks5 session"
+            );
+            Ok((0, 0))
+        }
     };
     match result {
         Ok((up_bytes, down_bytes)) => {
-            info!(
+            debug!(
                 client = %peer,
                 destination = %destination,
                 up_bytes,
@@ -393,6 +431,21 @@ async fn serve_connect(
         Err(err) => {
             warn!(client = %peer, destination = %destination, error = %err, "tcp relay failed after connect");
             Err(AppError::Io(err))
+        }
+    }
+}
+
+async fn wait_for_tcp_relay_idle(pool: &TunnelPool) {
+    let check_interval = Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(check_interval).await;
+        if pool
+            .snapshot()
+            .await
+            .last_traffic_age_secs
+            .is_some_and(|age| age >= TCP_RELAY_IDLE_TIMEOUT.as_secs())
+        {
+            return;
         }
     }
 }

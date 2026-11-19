@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -52,9 +51,15 @@ struct LogRecord {
     line: String,
 }
 
+#[derive(Default)]
+struct LogFileState {
+    path: Option<PathBuf>,
+    writer: Option<BufWriter<File>>,
+    bytes_written: u64,
+}
+
 static LOG_BUFFER: OnceLock<StdMutex<VecDeque<LogRecord>>> = OnceLock::new();
-static LOG_FILE_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
-static LOG_FILE_IO_LOCK: StdMutex<()> = StdMutex::new(());
+static LOG_FILE_STATE: OnceLock<StdMutex<LogFileState>> = OnceLock::new();
 static SERVICE_STATE: OnceLock<Arc<Mutex<ServiceState>>> = OnceLock::new();
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -75,8 +80,8 @@ fn log_buffer() -> &'static StdMutex<VecDeque<LogRecord>> {
     LOG_BUFFER.get_or_init(|| StdMutex::new(VecDeque::with_capacity(MAX_LOG_LINES)))
 }
 
-fn log_file_path() -> &'static StdMutex<Option<PathBuf>> {
-    LOG_FILE_PATH.get_or_init(|| StdMutex::new(None))
+fn log_file_state() -> &'static StdMutex<LogFileState> {
+    LOG_FILE_STATE.get_or_init(|| StdMutex::new(LogFileState::default()))
 }
 
 fn unix_now_millis() -> u64 {
@@ -124,7 +129,7 @@ fn initialize_log_file(path: PathBuf) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let _io_guard = LOG_FILE_IO_LOCK
+    let mut state = log_file_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -140,7 +145,7 @@ fn initialize_log_file(path: PathBuf) -> io::Result<()> {
     }
 
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
-    drop(file);
+    let initial_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -155,40 +160,58 @@ fn initialize_log_file(path: PathBuf) -> io::Result<()> {
         records.extend(loaded);
     }
 
-    let mut target = log_file_path()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *target = Some(path);
+    state.path = Some(path);
+    state.writer = Some(BufWriter::new(file));
+    state.bytes_written = initial_len;
     Ok(())
 }
 
 fn append_log_record(record: &LogRecord) {
-    let path = log_file_path()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let Some(path) = path else {
-        return;
-    };
-
-    let _io_guard = LOG_FILE_IO_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    if fs::metadata(&path)
-        .map(|metadata| metadata.len() >= MAX_LOG_FILE_BYTES)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("log.1");
-        let _ = fs::remove_file(&rotated);
-        let _ = fs::rename(&path, rotated);
-    }
-
     let Ok(encoded) = serde_json::to_string(record) else {
         return;
     };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{encoded}");
+
+    let mut state = log_file_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(path) = state.path.clone() else {
+        return;
+    };
+
+    if state.bytes_written >= MAX_LOG_FILE_BYTES {
+        if let Some(mut writer) = state.writer.take() {
+            let _ = writer.flush();
+        }
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, rotated);
+        state.bytes_written = 0;
+    }
+
+    if state.writer.is_none() {
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+            state.bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+            state.writer = Some(BufWriter::new(file));
+        }
+    }
+
+    let mut wrote = false;
+    if let Some(writer) = state.writer.as_mut() {
+        if writeln!(writer, "{encoded}").is_ok() {
+            wrote = true;
+            if record.line.contains("WARN") || record.line.contains("ERROR") {
+                let _ = writer.flush();
+            }
+        }
+    }
+    if wrote {
+        let line_bytes = (encoded.len() + 1) as u64;
+        state.bytes_written = state.bytes_written.saturating_add(line_bytes);
     }
 }
 
@@ -645,8 +668,9 @@ pub extern "system" fn Java_com_zqliang_ramaproxy_ProxyForegroundService_nativeR
     }
 }
 
-/// Holds the Android wake/Wi-Fi locks only while proxied connections are active,
-/// so the device may sleep when the proxy is idle. Ends when the runtime drops its stats sender.
+/// Holds the Android wake/Wi-Fi locks only while proxied connections are actively
+/// transferring bytes, so the device may sleep when the proxy or HTTP keep-alive sockets are idle.
+/// Ends when the runtime drops its stats sender.
 #[cfg(target_os = "android")]
 async fn drive_traffic_locks(
     app: Option<tauri::AppHandle>,
@@ -654,19 +678,14 @@ async fn drive_traffic_locks(
 ) {
     // Lock state Kotlin last confirmed; `None` after a failed call, which forces a resend.
     let mut confirmed = Some(false);
-    let mut last_busy: Option<std::time::Instant> = None;
     let mut last_sent = std::time::Instant::now();
     while pool_stats.changed().await.is_ok() {
         let now = std::time::Instant::now();
-        if pool_stats
+        let want = pool_stats
             .borrow_and_update()
             .as_ref()
-            .is_some_and(|snapshot| snapshot.active > 0)
-        {
-            last_busy = Some(now);
-        }
-        // Decided by traffic only; `confirmed` is used just to suppress duplicate calls.
-        let want = last_busy.is_some_and(|at| now.duration_since(at) < TRAFFIC_LOCK_RELEASE_DELAY);
+            .and_then(|snapshot| snapshot.last_traffic_age_secs)
+            .is_some_and(|age_secs| age_secs < TRAFFIC_LOCK_RELEASE_DELAY.as_secs());
         let refresh_due = want && now.duration_since(last_sent) >= TRAFFIC_LOCK_REFRESH_INTERVAL;
         if confirmed == Some(want) && !refresh_due {
             continue;
@@ -1225,20 +1244,20 @@ fn clear_logs() -> Result<(), String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
 
-    let path = log_file_path()
+    let mut state = log_file_state()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    if let Some(path) = path {
-        let _io_guard = LOG_FILE_IO_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        OpenOptions::new()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.writer = None;
+    state.bytes_written = 0;
+
+    if let Some(path) = state.path.clone() {
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&path)
             .map_err(|err| format!("清空日志文件失败: {err}"))?;
+        state.writer = Some(BufWriter::new(file));
         let rotated = path.with_extension("log.1");
         if rotated.is_file() {
             fs::remove_file(rotated).map_err(|err| format!("删除轮转日志失败: {err}"))?;

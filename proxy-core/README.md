@@ -4,7 +4,7 @@
 
 ## Release 1.4.2
 
-Patch release focused on Android foreground-service recovery:
+Patch release focused on Android foreground-service recovery and power consumption optimizations for mobile data collection:
 
 - When Android recreates the sticky foreground service with an empty intent, the
   service restores the Rust SOCKS5 runtime through JNI instead of waiting for
@@ -13,6 +13,10 @@ Patch release focused on Android foreground-service recovery:
   startup so concurrent paths cannot bind the local SOCKS5 port twice.
 - The client exposes restore progress and error state, while opening the app or
   returning to the foreground remains a fallback recovery path.
+- Android wake/Wi-Fi locks now follow actual byte flow (`lastTrafficAgeSecs < 30`) rather than open lease count, allowing device sleep even when HTTP keep-alive connections remain open; idle TCP relay sessions time out after 3 minutes.
+- Switched Android Wi-Fi lock from `WIFI_MODE_FULL_LOW_LATENCY` to `WIFI_MODE_FULL_HIGH_PERF`.
+- Added event-driven pool status notifications and a deep-idle maintenance mode that pauses background network ping probes after 3 minutes of inactivity.
+- Replaced per-line log file open/close with a persistent `BufWriter` and downgraded per-request SOCKS5 lifecycle logs from `info` to `debug`.
 
 The Android release is version `1.4.2` with `versionCode` `1402`.
 

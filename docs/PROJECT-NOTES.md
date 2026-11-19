@@ -1,6 +1,6 @@
 # Rama Proxy 项目注意事项与运维手册
 
-- 文档更新时间：2026-11-13
+- 文档更新时间：2026-11-19
 - 适用范围：仓库根目录、`proxy-core`、`proxy-gui`、`proxy-mobile`
 - Android 当前版本：`1.4.2`，版本号 `1402`
 - Android Release 包名：`com.zqliang.ramaproxy`
@@ -122,8 +122,9 @@ tls connect failed
 - 自动恢复会检查 `resume.intent`，再读取 `dataDir/client.toml`，重新初始化同名日志文件并启动 Rust runtime。
 - Tauri 命令和 JNI 恢复共用进程级 `SERVICE_STATE`；启动过程用互斥锁串行化，避免并发重复绑定 `127.0.0.1:1080`。
 - 恢复进度通过 `restoreInProgress` 暴露，失败原因通过 `restoreError` 返回；通知和界面会显示“恢复中”或需要重新打开应用。
-- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按流量持有**。连接池 `active > 0` 时立即申请；活动连接归零并持续 30 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
-  - “有流量”按连接池租约数 `active` 判断，不是按字节流动判断。经代理的长连接（WebSocket、SSH、浏览器 keep-alive 等）只要不断开，锁就一直持有，这种情况下系统仍可能提示耗电；这是为保证长连接下行数据能及时处理而有意保留的行为。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按实际字节流量持有**。代理隧道有字节读写时立即申请；最近一次字节传输结束并持续 30 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
+  - “有流量”按连接池实际字节读写时间 `lastTrafficAgeSecs` 判断，而非仅按租约数 `active` 判断。即使采集客户端持有 HTTP keep-alive 连接池未关闭，只要无实际数据收发超过 30 秒，锁就会自动释放；且空闲超过 3 分钟的本地 TCP 代理连接会自动关闭并释放隧道租约。
+  - 无代理流量超过 3 分钟后，连接池进入深度空闲模式（Deep Idle），暂停后台每 2 分钟的主动网络 Ping 探测（退避至 5 分钟并在池满时跳过网络探测），由下一次请求到来时按需校验，减少射频和 CPU 唤醒。
   - 释放锁后 Wi-Fi 进入省电模式，空闲后首个请求的延迟会略增，属于预期代价。
 - 空闲隧道的复用校验使用墙钟时间：`Instant` 在 Android 挂起期间不计时，长时间睡眠后的空闲隧道会在复用前先 ping 探测，失效则丢弃并新建。
 - 心跳由服务端推送，默认间隔 60 秒；客户端等待下一次心跳的超时为 `heartbeat_interval_secs + heartbeat_timeout_secs`。服务端与客户端的 `heartbeat_interval_secs` 应保持一致或客户端更大。

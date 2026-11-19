@@ -7,6 +7,9 @@ pub fn init(level: &str) -> Result<(), AppError> {
         .or_else(|_| EnvFilter::try_new("info"))
         .map_err(|err| AppError::InvalidConfig(format!("invalid log.level: {err}")))?;
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .init();
     Ok(())
 }

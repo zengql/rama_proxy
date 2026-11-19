@@ -324,7 +324,7 @@ tls connect failed
 - `START_STICKY`，进程被系统终止后允许 Android 重新创建 Kotlin 前台服务；当服务收到空 `intent` 时，会加载 native 库并通过 JNI 自动恢复 Rust SOCKS5。
 - 自动恢复读取应用数据目录中的 `resume.intent`、`client.toml` 和 `rama-proxy.log`。恢复期间界面显示“恢复中”，失败时通过 `restoreError` 显示原因。
 - Tauri 启动与 JNI 恢复共享同一份 Rust runtime 状态，并串行执行，避免重复绑定本地端口。
-- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按流量持有**：有代理连接时申请，连接全部结束 30 秒后释放；空闲时允许手机睡眠，避免系统提示“阻止睡眠 / 耗电异常”。经代理的长连接不断开时锁会一直持有。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按实际字节流量持有**：有代理流量读写时申请，最近一次字节传输结束 30 秒后释放；空闲连接（如 HTTP keep-alive 连接池）无数据流动时也会释放锁并允许手机睡眠，且超过 3 分钟无流量的空闲 TCP 代理连接会自动回收。
 - 通知渠道和电池优化豁免入口。必须加入电池优化白名单，否则 Doze 下后台网络会被切断。
 - 睡眠后首个请求会先探测空闲隧道，失效则重建，可能多一些延迟。
 

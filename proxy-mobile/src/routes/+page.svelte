@@ -21,6 +21,7 @@
     inspectingIdle: number;
     connecting: number;
     active: number;
+    lastTrafficAgeSecs: number | null;
     consecutiveFailures: number;
     nextRefillAllowedInSecs: number | null;
     createdTotal: number;
@@ -110,7 +111,9 @@
   onMount(() => {
     void initialize();
     const timer = window.setInterval(() => {
-      if (tauri) void refreshDiagnostics();
+      if (tauri && document.visibilityState === "visible") {
+        void refreshDiagnostics();
+      }
     }, 2000);
     const handleVisibilityChange = () => {
       if (!tauri || document.visibilityState !== "visible") return;
@@ -717,7 +720,7 @@
 
       {#if status.processId}
         <p class="service-note">
-          PID {status.processId} · WakeLock {status.wakeLockHeld ? "已持有" : "未持有"} · Wi-Fi Lock {status.wifiLockHeld ? "已持有" : "未持有"}（仅有代理连接时持有，空闲允许睡眠）
+          PID {status.processId} · WakeLock {status.wakeLockHeld ? "已持有" : "未持有"} · Wi-Fi Lock {status.wifiLockHeld ? "已持有" : "未持有"}（仅在实际转发字节时持有，空闲连接与无流量时允许睡眠）
         </p>
       {/if}
 

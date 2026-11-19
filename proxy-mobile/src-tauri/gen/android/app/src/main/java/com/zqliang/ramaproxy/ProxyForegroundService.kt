@@ -155,14 +155,19 @@ class ProxyForegroundService : Service() {
 
       if (wifiLock == null) {
         val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+        // Use WIFI_MODE_FULL_HIGH_PERF instead of WIFI_MODE_FULL_LOW_LATENCY:
+        // LOW_LATENCY completely disables Wi-Fi power saving (DTIM/PSM) for real-time gaming,
+        // causing severe radio battery drain during data collection.
+        @Suppress("DEPRECATION")
+        val lockMode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
         wifiLock = wifiManager
-          ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:rama-proxy-wifi")
+          ?.createWifiLock(lockMode, "$packageName:rama-proxy-wifi")
           ?.apply { setReferenceCounted(false) }
       }
       wifiLock?.let { wifi ->
         if (!wifi.isHeld) {
           wifi.acquire()
-          Log.i(TAG, "high performance wifi lock acquired for proxy traffic")
+          Log.i(TAG, "wifi lock acquired for proxy traffic")
         }
       }
     } else {
@@ -175,7 +180,7 @@ class ProxyForegroundService : Service() {
       wifiLock?.let { wifi ->
         if (wifi.isHeld) {
           wifi.release()
-          Log.i(TAG, "high performance wifi lock released; proxy is idle")
+          Log.i(TAG, "wifi lock released; proxy is idle")
         }
       }
     }
