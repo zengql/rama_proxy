@@ -41,12 +41,17 @@ const STATUS_RESOLVE_FAILED: u8 = 0x04;
 const STATUS_CLIENT_ID_REQUIRED: u8 = 0x05;
 const IDLE_TUNNEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const IDLE_TUNNEL_HEALTHY_FOR: Duration = Duration::from_secs(120);
+/// In deep idle, keep 1 verified standby tunnel probed at a much lower frequency
+/// (10 minutes) so the proxy always has a ready connection without triggering
+/// Android's "Frequently refreshes in the background" battery warning.
+const IDLE_TUNNEL_HEALTHY_FOR_DEEP_IDLE: Duration = Duration::from_secs(10 * 60);
 const POOL_MAINTENANCE_INTERVAL_FAST: Duration = Duration::from_secs(1);
 const POOL_MAINTENANCE_INTERVAL_SLOW: Duration = Duration::from_secs(30);
-/// After this long with zero proxy traffic, pause background idle tunnel probing
-/// so the radio and CPU can stay asleep until the next request arrives.
+/// After this long with zero proxy traffic, enter deep idle: scale standby pool
+/// target down to 1 connected tunnel and probe every 10 minutes.
 const POOL_DEEP_IDLE_AFTER: Duration = Duration::from_secs(3 * 60);
-const POOL_MAINTENANCE_INTERVAL_DEEP_IDLE: Duration = Duration::from_secs(5 * 60);
+const POOL_MAINTENANCE_INTERVAL_DEEP_IDLE: Duration = Duration::from_secs(10 * 60);
+const TUNNEL_TCP_KEEPALIVE_SECS: u64 = 300;
 const MAINTENANCE_SWEEP_BATCH: usize = 8;
 const MAX_STALE_TUNNELS_PER_ACQUIRE: usize = 2;
 const MAX_REFILL_BACKOFF: Duration = Duration::from_secs(30);
@@ -163,6 +168,33 @@ impl TunnelPool {
         self.state_notify.clone()
     }
 
+    /// Called when the host OS reports a network connectivity change (e.g. Android
+    /// Wi-Fi <-> 5G switch or wakeup with restored network). Clears refill backoff,
+    /// invalidates cached idle tunnel freshness so they are probed immediately, and
+    /// wakes the maintainer to ensure a connected tunnel is ready right away.
+    pub async fn notify_network_available(&self) {
+        {
+            let mut refill_state = self.refill_state.lock().await;
+            refill_state.consecutive_failures = 0;
+            refill_state.next_allowed_at = None;
+            refill_state.cooldown_logged_for = None;
+        }
+        // Expire `verified_at` on queued idle tunnels so the next sweep or acquire
+        // probes them against the new network interface before trusting them.
+        let mut drained = Vec::new();
+        {
+            let mut idle_rx = self.idle_rx.lock().await;
+            while let Ok(mut tunnel) = idle_rx.try_recv() {
+                tunnel.verified_at = UNIX_EPOCH;
+                drained.push(tunnel);
+            }
+        }
+        for tunnel in drained {
+            let _ = self.idle_tx.send(tunnel).await;
+        }
+        self.state_notify.notify_waiters();
+    }
+
     fn is_deep_idle(&self) -> bool {
         if self.active.load(Ordering::Relaxed) > 0 {
             return false;
@@ -175,17 +207,29 @@ impl TunnelPool {
         elapsed_ms >= POOL_DEEP_IDLE_AFTER.as_millis() as u64
     }
 
+    /// In deep idle (no traffic for >= 3 minutes), keep 1 connected standby tunnel
+    /// instead of the full `warm_idle_target` so the app always has an immediate
+    /// network connection ready without firing keepalives across multiple idle sockets.
+    /// Scales back up to `warm_idle_target` immediately on the next request.
+    fn effective_warm_target(&self) -> usize {
+        if self.is_deep_idle() {
+            self.warm_idle_target.min(1)
+        } else {
+            self.warm_idle_target
+        }
+    }
+
     pub fn spawn_maintainer(&self) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
+            // Initialize the idle clock so deep idle activates 3 minutes after startup
+            // even if zero requests were sent right after starting the app.
+            this.last_traffic_unix_ms
+                .compare_exchange(0, unix_now_millis(), Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
             loop {
-                // In deep idle (no proxy traffic for >= 3 minutes) while the pool is already full,
-                // skip active network ping probes so the radio and CPU can stay in deep sleep.
-                // Any stale tunnel will be probed lazily on the next `acquire()`.
-                if !(this.is_deep_idle() && this.idle_len() >= this.warm_idle_target) {
-                    this.reap_idle_tunnels().await;
-                    this.schedule_refill().await;
-                }
+                this.reap_idle_tunnels().await;
+                this.schedule_refill().await;
                 let interval = this.pick_maintenance_interval().await;
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
@@ -202,6 +246,7 @@ impl TunnelPool {
         let inspecting = self.inspecting_idle.load(Ordering::Relaxed);
         let connecting = self.connecting.load(Ordering::Relaxed);
         let in_flight = inspecting.saturating_add(connecting);
+        let target = self.effective_warm_target();
 
         // If refill is backing off, honor the backoff cooldown
         {
@@ -218,8 +263,8 @@ impl TunnelPool {
             }
         }
 
-        // Pool is below the warm target or refills/probes are running — stay fast.
-        if idle.saturating_add(in_flight) < self.warm_idle_target || in_flight > 0 {
+        // Pool is below the effective warm target or refills/probes are running — stay fast.
+        if idle.saturating_add(in_flight) < target || in_flight > 0 {
             return POOL_MAINTENANCE_INTERVAL_FAST;
         }
 
@@ -252,7 +297,7 @@ impl TunnelPool {
 
         TunnelPoolSnapshot {
             max_idle_size: self.max_idle_size,
-            warm_idle_target: self.warm_idle_target,
+            warm_idle_target: self.effective_warm_target(),
             idle: self.idle_len(),
             inspecting_idle: self.inspecting_idle.load(Ordering::Relaxed),
             connecting: self.connecting.load(Ordering::Relaxed),
@@ -276,12 +321,13 @@ impl TunnelPool {
 
     async fn schedule_refill(&self) {
         let now = Instant::now();
+        let target = self.effective_warm_target();
         let (idle, inspecting_idle, connecting, missing) = {
             let mut refill_state = self.refill_state.lock().await;
             let idle = self.idle_len();
             let inspecting_idle = self.inspecting_idle.load(Ordering::Relaxed);
             let connecting = self.connecting.load(Ordering::Relaxed);
-            let missing = self.warm_idle_target.saturating_sub(
+            let missing = target.saturating_sub(
                 idle.saturating_add(inspecting_idle)
                     .saturating_add(connecting),
             );
@@ -292,7 +338,7 @@ impl TunnelPool {
                 if now < next_allowed_at {
                     if refill_state.cooldown_logged_for != Some(next_allowed_at) {
                         warn!(
-                            warm_idle_target = self.warm_idle_target,
+                            warm_idle_target = target,
                             max_idle_size = self.max_idle_size,
                             idle,
                             inspecting_idle,
@@ -315,7 +361,7 @@ impl TunnelPool {
         };
 
         info!(
-            warm_idle_target = self.warm_idle_target,
+            warm_idle_target = target,
             max_idle_size = self.max_idle_size,
             idle,
             inspecting_idle,
@@ -554,12 +600,33 @@ impl TunnelPool {
         self.inspecting_idle
             .fetch_add(drained.len(), Ordering::SeqCst);
 
+        let deep_idle = self.is_deep_idle();
+        let target = self.effective_warm_target();
+        let healthy_for = if deep_idle {
+            IDLE_TUNNEL_HEALTHY_FOR_DEEP_IDLE
+        } else {
+            IDLE_TUNNEL_HEALTHY_FOR
+        };
+        let mut kept_in_deep_idle = 0usize;
+
         for mut idle_tunnel in drained {
+            // In deep idle, shed excess idle tunnels down to `target` (1) so only a single
+            // standby TCP connection stays open in the background, minimizing radio wakeups.
+            if deep_idle && kept_in_deep_idle >= target {
+                self.inspecting_idle.fetch_sub(1, Ordering::SeqCst);
+                debug!(
+                    tunnel_id = idle_tunnel.tunnel_id,
+                    target, "releasing excess idle tunnel in deep-idle standby mode"
+                );
+                continue;
+            }
+
             if idle_tunnel
                 .verified_at
                 .elapsed()
-                .is_ok_and(|age| age < IDLE_TUNNEL_HEALTHY_FOR)
+                .is_ok_and(|age| age < healthy_for)
             {
+                kept_in_deep_idle = kept_in_deep_idle.saturating_add(1);
                 self.return_idle_tunnel(idle_tunnel).await;
                 continue;
             }
@@ -571,6 +638,7 @@ impl TunnelPool {
                         tunnel_id = idle_tunnel.tunnel_id,
                         "idle tunnel probe succeeded"
                     );
+                    kept_in_deep_idle = kept_in_deep_idle.saturating_add(1);
                     self.return_idle_tunnel(idle_tunnel).await;
                 }
                 Err(err) => {
@@ -711,6 +779,10 @@ async fn connect_idle_tunnel(
         .await
         .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))??;
     stream.set_nodelay(true)?;
+    let socket = socket2::SockRef::from(&stream);
+    let keepalive =
+        socket2::TcpKeepalive::new().with_time(Duration::from_secs(TUNNEL_TCP_KEEPALIVE_SECS));
+    let _ = socket.set_tcp_keepalive(&keepalive);
     let tls_backend = tls.as_ref().map(|tls| tls.backend).unwrap_or("plain");
     let tls_server_name = tls
         .as_ref()
@@ -795,7 +867,7 @@ pub async fn run_heartbeat(
                 ))
             })??;
         write_heartbeat_ack(&mut stream, &ids).await?;
-        info!(
+        debug!(
             heartbeat_id,
             tunnel_count = ids.len(),
             tunnel_ids = ?ids,

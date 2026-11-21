@@ -13,9 +13,11 @@ Patch release focused on Android foreground-service recovery and power consumpti
   startup so concurrent paths cannot bind the local SOCKS5 port twice.
 - The client exposes restore progress and error state, while opening the app or
   returning to the foreground remains a fallback recovery path.
-- Android wake/Wi-Fi locks now follow actual byte flow (`lastTrafficAgeSecs < 30`) rather than open lease count, allowing device sleep even when HTTP keep-alive connections remain open; idle TCP relay sessions time out after 3 minutes.
+- Android wake/Wi-Fi locks now follow actual byte flow (`lastTrafficAgeSecs < 10`) rather than open lease count, releasing locks 10 seconds after bytes stop flowing even when HTTP keep-alive connections remain open; idle TCP relay sessions time out after 3 minutes.
 - Switched Android Wi-Fi lock from `WIFI_MODE_FULL_LOW_LATENCY` to `WIFI_MODE_FULL_HIGH_PERF`.
-- Added event-driven pool status notifications and a deep-idle maintenance mode that pauses background network ping probes after 3 minutes of inactivity.
+- Added Android `ConnectivityManager.NetworkCallback` integration to immediately probe and refill the tunnel pool when network connectivity changes or recovers.
+- Disabled the redundant 60-second heartbeat control channel on mobile (`heartbeat_interval_secs = 0`) and added exponential backoff (`10s -> 300s`) for heartbeat reconnects to eliminate Android's "Frequently refreshes in the background" battery warning.
+- Added event-driven pool status notifications and a deep-idle standby mode (after 3 minutes of inactivity) that keeps 1 verified connected tunnel probed every 10 minutes and immediately scales back up to full `pool_size` on traffic.
 - Replaced per-line log file open/close with a persistent `BufWriter` and downgraded per-request SOCKS5 lifecycle logs from `info` to `debug`.
 
 The Android release is version `1.4.2` with `versionCode` `1402`.

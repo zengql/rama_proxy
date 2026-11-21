@@ -122,9 +122,11 @@ tls connect failed
 - 自动恢复会检查 `resume.intent`，再读取 `dataDir/client.toml`，重新初始化同名日志文件并启动 Rust runtime。
 - Tauri 命令和 JNI 恢复共用进程级 `SERVICE_STATE`；启动过程用互斥锁串行化，避免并发重复绑定 `127.0.0.1:1080`。
 - 恢复进度通过 `restoreInProgress` 暴露，失败原因通过 `restoreError` 返回；通知和界面会显示“恢复中”或需要重新打开应用。
-- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按实际字节流量持有**。代理隧道有字节读写时立即申请；最近一次字节传输结束并持续 30 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
-  - “有流量”按连接池实际字节读写时间 `lastTrafficAgeSecs` 判断，而非仅按租约数 `active` 判断。即使采集客户端持有 HTTP keep-alive 连接池未关闭，只要无实际数据收发超过 30 秒，锁就会自动释放；且空闲超过 3 分钟的本地 TCP 代理连接会自动关闭并释放隧道租约。
-  - 无代理流量超过 3 分钟后，连接池进入深度空闲模式（Deep Idle），暂停后台每 2 分钟的主动网络 Ping 探测（退避至 5 分钟并在池满时跳过网络探测），由下一次请求到来时按需校验，减少射频和 CPU 唤醒。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock：**按实际字节流量持有**。代理隧道有字节读写时立即申请；最近一次字节传输结束并持续 10 秒后释放。WakeLock 带 10 分钟超时兜底，有流量期间 Rust 每 2 分钟续期一次；Rust 运行时退出时会主动释放。空闲时允许设备睡眠，避免系统提示“阻止睡眠 / 耗电异常”。
+  - “有流量”按连接池实际字节读写时间 `lastTrafficAgeSecs < 10` 判断，而非仅按租约数 `active` 判断。即使采集客户端持有 HTTP keep-alive 连接池未关闭，只要无实际数据收发超过 10 秒，锁就会自动释放；且空闲超过 3 分钟的本地 TCP 代理连接会自动关闭并释放隧道租约。
+  - 移动端关闭冗余的 60 秒独立心跳通道（`heartbeat_interval_secs = 0`），避免每天 1,440 次后台射频唤醒触发 Android 系统“Frequently refreshes in the background（后台频繁刷新）”告警。
+  - 无代理流量超过 3 分钟后，连接池进入深度空闲热备模式（Deep Idle Standby）：自动收缩多余空闲连接，**始终保留 1 条已验证的在线热备隧道**（探测间隔放宽至 10 分钟，并配置 300 秒 TCP Keepalive），新请求到来时立即复用并扩容回完整 `poolSize`。
+  - `ProxyForegroundService` 注册 `ConnectivityManager.NetworkCallback`（需 `ACCESS_NETWORK_STATE` 权限），在 Wi-Fi / 5G 切换或网络恢复时通过 JNI `nativeNotifyNetworkAvailable` 立即唤醒 Rust 连接池探测并补池，保证代理时刻具备可用网络连接。
   - 释放锁后 Wi-Fi 进入省电模式，空闲后首个请求的延迟会略增，属于预期代价。
 - 空闲隧道的复用校验使用墙钟时间：`Instant` 在 Android 挂起期间不计时，长时间睡眠后的空闲隧道会在复用前先 ping 探测，失效则丢弃并新建。
 - 心跳由服务端推送，默认间隔 60 秒；客户端等待下一次心跳的超时为 `heartbeat_interval_secs + heartbeat_timeout_secs`。服务端与客户端的 `heartbeat_interval_secs` 应保持一致或客户端更大。

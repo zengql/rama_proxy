@@ -18,7 +18,7 @@ use rustls::pki_types::{pem::PemObject, CertificateDer};
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex, Notify};
 use tracing::{info, warn};
 use tracing_subscriber::{filter::EnvFilter, fmt::MakeWriter};
 
@@ -31,9 +31,9 @@ const CA_CERT_FILE: &str = "ca.pem";
 const MAX_CA_CERT_BYTES: usize = 512 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Keep the wake/Wi-Fi locks this long after the last proxied connection closes.
+/// Keep the wake/Wi-Fi locks this long after the last byte transferred through the proxy.
 #[cfg(target_os = "android")]
-const TRAFFIC_LOCK_RELEASE_DELAY: Duration = Duration::from_secs(30);
+const TRAFFIC_LOCK_RELEASE_DELAY: Duration = Duration::from_secs(10);
 /// Re-send "active" this often so the Android-side 10 minute lock timeout never expires
 /// mid-traffic; leaves room for several failed bridge calls before the timeout.
 #[cfg(target_os = "android")]
@@ -61,6 +61,7 @@ struct LogFileState {
 static LOG_BUFFER: OnceLock<StdMutex<VecDeque<LogRecord>>> = OnceLock::new();
 static LOG_FILE_STATE: OnceLock<StdMutex<LogFileState>> = OnceLock::new();
 static SERVICE_STATE: OnceLock<Arc<Mutex<ServiceState>>> = OnceLock::new();
+static NETWORK_EVENT_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "android")]
@@ -70,6 +71,10 @@ static ANDROID_SERVICE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 
 fn shared_service_state() -> &'static Arc<Mutex<ServiceState>> {
     SERVICE_STATE.get_or_init(|| Arc::new(Mutex::new(ServiceState::default())))
+}
+
+fn network_event_notify() -> &'static Arc<Notify> {
+    NETWORK_EVENT_NOTIFY.get_or_init(|| Arc::new(Notify::new()))
 }
 
 fn next_generation() -> u64 {
@@ -310,11 +315,17 @@ impl ClientSettings {
         config.client.shared_secret = self.shared_secret.clone();
         config.client.client_id = self.client_id.trim().to_string();
         config.client.pool_size = self.pool_size;
+        // Disable the separate 60-second heartbeat control channel on mobile:
+        // TunnelPool already maintains, probes, and refills the warm data tunnels,
+        // and the 60s server heartbeat push caused 1,440 radio wakeups/day and
+        // triggered Android's "Frequently refreshes in the background" battery warning.
+        config.client.heartbeat_interval_secs = 0;
 
         // Mobile clients are intentionally local-only. Do not accept a
         // configurable LAN bind address from the frontend.
         config.socks5.bind = LOCAL_BIND.to_string();
         config.socks5.port = self.socks5_port;
+        config.socks5.tcp_keepalive_secs = 300;
 
         config.http_connect.port = None;
         config.udp.enabled = self.udp_enabled;
@@ -614,8 +625,10 @@ async fn restore_runtime_from_android(data_dir: String) -> Result<String, String
     }
 
     let config_path = data_dir.join(CONFIG_FILE);
-    let config = ClientConfigFile::from_path(&config_path)
+    let mut config = ClientConfigFile::from_path(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+    config.client.heartbeat_interval_secs = 0;
+    config.socks5.tcp_keepalive_secs = 300;
 
     info!(
         data_dir = %data_dir.display(),
@@ -666,6 +679,15 @@ pub extern "system" fn Java_com_zqliang_ramaproxy_ProxyForegroundService_nativeR
             JNI_FALSE
         }
     }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_zqliang_ramaproxy_ProxyForegroundService_nativeNotifyNetworkAvailable(
+    _env: JNIEnv<'_>,
+    _service: JObject<'_>,
+) {
+    network_event_notify().notify_waiters();
 }
 
 /// Holds the Android wake/Wi-Fi locks only while proxied connections are actively
@@ -1045,14 +1067,17 @@ async fn start_runtime(
     #[cfg(target_os = "android")]
     tauri::async_runtime::spawn(drive_traffic_locks(app.clone(), pool_stats_rx.clone()));
 
+    let network_events = network_event_notify().clone();
     let task = tauri::async_runtime::spawn(async move {
-        let result = proxy_core::client_runtime::run_with_shutdown_ready_and_pool_stats(
-            config,
-            shutdown_rx,
-            Some(ready_tx),
-            Some(pool_stats_tx),
-        )
-        .await;
+        let result =
+            proxy_core::client_runtime::run_with_shutdown_ready_pool_stats_and_network_events(
+                config,
+                shutdown_rx,
+                Some(ready_tx),
+                Some(pool_stats_tx),
+                Some(network_events),
+            )
+            .await;
 
         let foreground_stop_error = if let Some(app) = task_app.as_ref() {
             stop_foreground_service(app).await.err()

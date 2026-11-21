@@ -9,6 +9,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Log
@@ -16,9 +18,11 @@ import java.io.File
 
 class ProxyForegroundService : Service() {
   private external fun nativeRuntimeBridge(dataDir: String, restore: Boolean): Boolean
+  private external fun nativeNotifyNetworkAvailable()
 
   private var wakeLock: PowerManager.WakeLock? = null
   private var wifiLock: WifiManager.WifiLock? = null
+  private var networkCallback: ConnectivityManager.NetworkCallback? = null
   // Written on the main thread, read from the plugin bridge thread in setTrafficActive().
   @Volatile
   private var systemRestartPending: Boolean = false
@@ -28,6 +32,7 @@ class ProxyForegroundService : Service() {
     Log.i(TAG, "foreground service onCreate")
     createNotificationChannel()
     instance = this
+    registerNetworkCallback()
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -190,6 +195,7 @@ class ProxyForegroundService : Service() {
   }
 
   override fun onDestroy() {
+    unregisterNetworkCallback()
     instance = null
     trafficActive = false
     restoreInProgress = false
@@ -205,6 +211,42 @@ class ProxyForegroundService : Service() {
       stopForeground(true)
     }
     super.onDestroy()
+  }
+
+  private fun registerNetworkCallback() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || networkCallback != null) return
+    val connectivityManager =
+      applicationContext.getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+    val callback = object : ConnectivityManager.NetworkCallback() {
+      override fun onAvailable(network: Network) {
+        Log.i(TAG, "default network available; notifying Rust tunnel pool")
+        try {
+          if (ensureNativeLoaded()) {
+            nativeNotifyNetworkAvailable()
+          }
+        } catch (error: Throwable) {
+          Log.w(TAG, "failed to notify native runtime of network availability", error)
+        }
+      }
+    }
+    try {
+      connectivityManager.registerDefaultNetworkCallback(callback)
+      networkCallback = callback
+    } catch (error: Throwable) {
+      Log.w(TAG, "failed to register default network callback", error)
+    }
+  }
+
+  private fun unregisterNetworkCallback() {
+    val callback = networkCallback ?: return
+    networkCallback = null
+    val connectivityManager =
+      applicationContext.getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+    try {
+      connectivityManager.unregisterNetworkCallback(callback)
+    } catch (error: Throwable) {
+      Log.w(TAG, "failed to unregister default network callback", error)
+    }
   }
 
   override fun onBind(intent: Intent?): IBinder? = null

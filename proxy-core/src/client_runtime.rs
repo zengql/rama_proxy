@@ -65,9 +65,23 @@ pub async fn run_with_shutdown_ready(
 /// snapshot for embedded clients that expose diagnostics in their UI.
 pub async fn run_with_shutdown_ready_and_pool_stats(
     config: ClientConfigFile,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    ready: Option<tokio::sync::oneshot::Sender<Result<SocketAddr, String>>>,
+    pool_stats: Option<tokio::sync::watch::Sender<Option<TunnelPoolSnapshot>>>,
+) -> Result<(), AppError> {
+    run_with_shutdown_ready_pool_stats_and_network_events(config, shutdown, ready, pool_stats, None)
+        .await
+}
+
+/// Like [`run_with_shutdown_ready_and_pool_stats`], and accepts an optional
+/// notification handle that the host OS can trigger whenever network connectivity
+/// becomes available or switches interfaces.
+pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
+    config: ClientConfigFile,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     ready: Option<tokio::sync::oneshot::Sender<Result<SocketAddr, String>>>,
     pool_stats: Option<tokio::sync::watch::Sender<Option<TunnelPoolSnapshot>>>,
+    network_events: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<(), AppError> {
     let prepared = async {
         let bind_ip = parse_bind_ip(&config.socks5.bind)?;
@@ -90,6 +104,18 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
     };
 
     let maintainer = pool.spawn_maintainer();
+    let network_listener = network_events.clone().map(|events| {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            loop {
+                events.notified().await;
+                info!(
+                    "host network connectivity change notified; probing and refilling tunnel pool"
+                );
+                pool.notify_network_available().await;
+            }
+        })
+    });
     let stats_sender = pool_stats.clone();
     let stats_task = pool_stats.map(|sender| {
         let pool = pool.clone();
@@ -98,7 +124,7 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
             loop {
                 let snapshot = pool.snapshot().await;
                 let is_active = snapshot.active > 0;
-                let has_recent_traffic = snapshot.last_traffic_age_secs.is_some_and(|age| age < 35);
+                let has_recent_traffic = snapshot.last_traffic_age_secs.is_some_and(|age| age < 12);
                 let has_backoff = snapshot.next_refill_allowed_in_secs.is_some();
                 sender.send_if_modified(|current| {
                     if current.as_ref() != Some(&snapshot) {
@@ -109,15 +135,15 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
                     }
                 });
                 // Event-driven wakeup on tunnel state changes, with a low-power fallback timer:
-                // - 2s while traffic is actively flowing or cooling down so lock release is prompt
+                // - 2s while traffic is actively flowing or cooling down (10s lock window)
                 // - 5s during refill backoff so countdown UI updates
-                // - 30s when completely idle so the CPU/Tokio runtime stays asleep
+                // - 60s when completely idle so the CPU/Tokio runtime stays asleep
                 let interval = if is_active || has_recent_traffic {
                     Duration::from_secs(2)
                 } else if has_backoff {
                     Duration::from_secs(5)
                 } else {
-                    Duration::from_secs(30)
+                    Duration::from_secs(60)
                 };
                 tokio::select! {
                     _ = notify.notified() => {}
@@ -127,7 +153,12 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
         })
     });
     let heartbeat_config = config.clone();
+    let heartbeat_network_events = network_events;
     let heartbeat = tokio::spawn(async move {
+        if heartbeat_config.client.heartbeat_interval_secs == 0 {
+            debug!("client heartbeat channel is disabled (heartbeat_interval_secs = 0)");
+            return;
+        }
         let server_addr = match heartbeat_config.client.server_addr.parse() {
             Ok(addr) => addr,
             Err(err) => {
@@ -135,7 +166,9 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
                 return;
             }
         };
+        let mut consecutive_failures = 0u32;
         loop {
+            let started = Instant::now();
             let result = match build_client_tls_context(&heartbeat_config.tls) {
                 Ok(tls) => {
                     run_heartbeat(
@@ -157,15 +190,33 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
                 }
                 Err(err) => Err(err),
             };
+            if started.elapsed() >= Duration::from_secs(30) {
+                consecutive_failures = 0;
+            }
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    consecutive_failures = 0;
+                }
                 Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let shift = consecutive_failures.saturating_sub(1).min(5);
+                    let retry_secs = (10u64 << shift).min(300);
                     warn!(
                         error = %err,
-                        retry_secs = 10,
-                        "heartbeat channel unavailable; retrying"
+                        consecutive_failures,
+                        retry_secs,
+                        "heartbeat channel unavailable; backing off before retry"
                     );
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if let Some(events) = heartbeat_network_events.as_ref() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(retry_secs)) => {}
+                            _ = events.notified() => {
+                                consecutive_failures = 0;
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                    }
                 }
             }
         }
@@ -225,6 +276,10 @@ pub async fn run_with_shutdown_ready_and_pool_stats(
     while sessions.join_next().await.is_some() {}
     maintainer.abort();
     heartbeat.abort();
+    if let Some(network_listener) = network_listener {
+        network_listener.abort();
+        let _ = network_listener.await;
+    }
     if let Some(stats_task) = stats_task {
         stats_task.abort();
         let _ = stats_task.await;

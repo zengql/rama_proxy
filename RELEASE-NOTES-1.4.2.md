@@ -1,6 +1,6 @@
 # rama-proxy v1.4.2 发布说明
 
-- 发布日期：2026-11-19
+- 发布日期：2026-11-21
 - 版本：v1.4.2（上一版本 v1.4.1 / Android versionCode 1401）
 - 发布分支：`1.4.2`（基于 `1.4.1`）
 - 平台：Android 本地 SOCKS5 客户端与 `proxy-core` 功耗及性能优化
@@ -11,7 +11,7 @@
 v1.4.2 包含两部分核心改进：
 
 1. **Android 前台服务恢复修复**：解决系统回收并重建 Rama Proxy 进程或前台服务后，本地 SOCKS5 端口没有恢复，导致使用 `127.0.0.1:1080` 的其他代理/VPN 前端或数据采集应用全部断流的问题。
-2. **数据采集场景功耗与运行时效率优化**：解决 HTTP keep-alive 空闲连接长期阻止设备休眠、Wi-Fi 低延迟锁过度耗电、后台无流量时定时轮询与网络探测频繁唤醒 CPU/射频，以及高频请求下日志文件频繁同步打开/关闭带来的磁盘 I/O 开销。
+2. **数据采集场景深度功耗优化与消除“后台频繁刷新”告警**：消除 Android 系统电池管理提示 **“Frequently refreshes in the background. Force stop to save power.”（后台频繁刷新）** 及 ~234 mAh 的后台射频待机耗电，同时通过 **1 条常驻热备隧道 + Android `ConnectivityManager.NetworkCallback` 网络事件驱动秒级重连** 确保代理时刻具备可用网络连接。
 
 ## 问题现象与原因
 
@@ -21,13 +21,12 @@ v1.4.2 包含两部分核心改进：
 - 旧实现能够重建 Kotlin 前台服务，但没有在该路径恢复 Rust SOCKS5 runtime。
 - Rust runtime 不存在时，`127.0.0.1:1080` 不会被监听；上层代理或采集客户端虽然仍在运行，但所有连接都会失败，直到用户手动重新打开应用触发 `resume.intent` 恢复。
 
-### 2. 数据采集批次间隔与空闲期耗电偏高
+### 2. Android 告警“Frequently refreshes in the background”与后台射频高耗电
 
-- **HTTP Keep-Alive 空闲连接长期持锁**：v1.4.1 按连接池 `active > 0`（租约数）判断是否持锁。数据采集客户端（OkHttp、浏览器/WebView、采集脚本等）在批次间隔期间会保持 HTTP keep-alive 连接不关闭，导致即使没有任何字节传输，`PARTIAL_WAKE_LOCK` 和 Wi-Fi Lock 也会一直持有。
-- **Wi-Fi 锁模式过高**：Android 10+ 下使用了 `WIFI_MODE_FULL_LOW_LATENCY`，完全禁用了 Wi-Fi 省电机制（DTIM/PSM），导致无线射频持续处于高功耗状态。
-- **空闲时后台轮询与网络探测频繁唤醒**：
-  - `stats_task` 在无连接时仍每 5 秒轮询并无条件向 `watch::channel` 发送通知，唤醒锁驱动协程。
-  - 连接池维护任务在长时间无业务流量时仍每 30 秒唤醒、每 2 分钟对所有空闲隧道发送网络 Ping/Pong 探测包，阻碍基带与 CPU 深度休眠。
+- **60 秒独立心跳通道全天候唤醒无线射频**：旧逻辑下客户端维持一条独立的心跳控制连接，每 60 秒接收服务端 `OP_HEARTBEAT` 并回复 `OP_HEARTBEAT_ACK`（每天 1,440 次后台网络收发），且每次写入 `INFO` 日志。在 5G/Wi-Fi 下，每分钟一次的网络包会使基带/射频反复进入 10~15 秒的高功耗 Tail 状态（CPU 仅运行 2 分钟却消耗 233.90 mAh 电量），并触发 Android 厂商电源管理（PowerGenie 等）的“后台频繁刷新”检测。
+- **HTTP Keep-Alive 空闲连接长期持锁**：v1.4.1 按连接池 `active > 0`（租约数）判断是否持锁。数据采集客户端（OkHttp、浏览器/WebView、采集脚本等）在批次间隔期间保持 HTTP keep-alive 连接不关闭，导致即使没有任何字节传输，`PARTIAL_WAKE_LOCK` 和 Wi-Fi Lock 也会一直持有。
+- **Wi-Fi 锁模式过高**：Android 10+ 下使用了 `WIFI_MODE_FULL_LOW_LATENCY`，完全禁用了 Wi-Fi 省电机制（DTIM/PSM）。
+- **深度空闲期维持多条空闲连接与高频轮询**：无流量时仍维持 `poolSize`（默认 4 条）空闲连接并高频轮询状态。
 - **每次日志写入执行同步文件 `stat` + `open` + `write` + `close`**：单次 SOCKS5 请求默认输出 4 条 `INFO` 日志，每条日志都在异步工作线程上同步打开和关闭 `rama-proxy.log`。
 
 ## 变更
@@ -41,18 +40,19 @@ v1.4.2 包含两部分核心改进：
 - Rust 恢复完成后回调 Service，更新运行状态、通知、WakeLock/Wi-Fi Lock 和界面状态。
 - Android 插件状态新增 `restoreInProgress` 和 `restoreError`；前端新增 `foregroundServiceRestoring`，避免 Service 自动恢复期间重复发起启动。
 
-### Android & proxy-core：按实际字节流量持锁与空闲连接回收
+### Android & proxy-core：消除后台频繁刷新告警并保证网络时刻在线
 
-- `TunnelLease` 在 `poll_read` / `poll_write` 实际读写字节时更新原子时间戳 `last_traffic_unix_ms`，并在 `TunnelPoolSnapshot` 中暴露 `lastTrafficAgeSecs`。
-- Android `drive_traffic_locks` 改为按 `lastTrafficAgeSecs < 30` 决定是否持有 `PARTIAL_WAKE_LOCK` 和 Wi-Fi Lock：即使客户端保持空闲的 HTTP keep-alive 连接，只要超过 30 秒无实际字节流动，即自动释放锁允许设备休眠。
-- 新增本地 SOCKS5 TCP 转发空闲超时（`TCP_RELAY_IDLE_TIMEOUT = 180s`），自动关闭长期无数据收发的半开或僵尸 keep-alive 连接并归还隧道租约。
-- `ProxyForegroundService` 的 Wi-Fi Lock 统一改为 `WIFI_MODE_FULL_HIGH_PERF`，不再使用高耗电的 `WIFI_MODE_FULL_LOW_LATENCY`。
-
-### proxy-core：事件驱动状态推送与连接池深度空闲（Deep Idle）
-
-- `TunnelPool` 新增 `Notify` 事件通知：在获取隧道、释放租约、补池完成或失败时立即触发通知。
-- `stats_task` 改为 `Notify` 事件驱动 + `send_if_modified`（状态未变时不唤醒下游），完全空闲且无退避时轮询间隔退避至 30 秒。
-- 连接池维护任务新增 **深度空闲模式（Deep Idle）**：当无代理流量持续超过 3 分钟且连接池已满时，暂停后台主动网络 Ping 探测并将维护间隔延长至 5 分钟（新请求到来时通过 `Notify` 立即唤醒并在 `acquire` 时按需探测）。
+- **移动端关闭冗余 60 秒心跳控制通道**：`TunnelPool` 本身已具备隧道预热、探测与自动补池能力；移动端将 `heartbeat_interval_secs` 设为 `0` 关闭冗余的每分钟心跳通道（桌面端/服务端仍保留原默认值，且支持指数退避重连 `10s -> 300s` 并下调心跳快照日志为 `debug!`）。
+- **深度空闲单隧道热备（Always-Connected Standby）**：
+  - 活跃期及流量结束后 3 分钟内，维持完整的 `poolSize`（如 4 条）热备连接池。
+  - 无代理流量超过 3 分钟后进入深度空闲（Deep Idle）：自动收缩多余空闲隧道，**始终保留 1 条已验证的在线热备隧道**，并将后台探测周期放宽至 **10 分钟**（同时为隧道配置 300 秒 TCP Keepalive）。一旦有新请求到来，立即复用该热备隧道并瞬间扩容回完整 `poolSize`。
+- **Android 系统网络切换事件驱动秒级重连（`ConnectivityManager.NetworkCallback`）**：
+  - `ProxyForegroundService` 注册系统默认网络监听（新增 `ACCESS_NETWORK_STATE` 权限），当 Wi-Fi / 5G 切换或设备唤醒网络恢复（`onAvailable`）时，通过 JNI `nativeNotifyNetworkAvailable` 立即唤醒 Rust 连接池重置退避、校验旧连接并补充新隧道，无需高频定时器轮询即可保证网络时刻连通。
+- **按实际字节流量持锁与 10 秒快速释锁**：
+  - `TunnelLease` 在 `poll_read` / `poll_write` 实际读写字节时更新原子时间戳 `last_traffic_unix_ms`（暴露为 `lastTrafficAgeSecs`）。
+  - Android `drive_traffic_locks` 改为按 `lastTrafficAgeSecs < 10` 持有 `PARTIAL_WAKE_LOCK` 和 Wi-Fi Lock：字节停止流动 10 秒后立即释放锁，即使采集器保持 HTTP keep-alive 连接不关也不会阻止手机休眠。
+  - 新增本地 SOCKS5 TCP 转发空闲超时（`TCP_RELAY_IDLE_TIMEOUT = 180s`），自动回收长期无数据收发的僵尸连接。
+  - `ProxyForegroundService` 的 Wi-Fi Lock 统一改为 `WIFI_MODE_FULL_HIGH_PERF`，不再使用高耗电的 `WIFI_MODE_FULL_LOW_LATENCY`。
 
 ### proxy-mobile & proxy-core：日志常驻缓冲写入与级别降噪
 
@@ -85,4 +85,4 @@ v1.4.2 包含两部分核心改进：
 - `START_STICKY` 不保证 Service 一定被系统重建；强制停止、厂商禁止自启动或激进省电策略仍可能阻止恢复。
 - 自动恢复依赖 `resume.intent` 和有效的 `client.toml`。标记或配置缺失、native 库加载失败、端口绑定失败时会显示 `restoreError`。
 - 自动恢复只负责恢复本地 SOCKS5 runtime，不能修复上游网络、TLS 证书或服务端不可达等外部故障。
-- 释放锁后 Wi-Fi 进入省电模式，空闲睡眠后首个请求可能需要探测或重建隧道，延迟略增。
+- 深度空闲期连接池显示的 `warmIdleTarget` 和 `idle` 为 `1` 属于正常省电热备状态，有流量时会立即恢复为配置的 `poolSize`。

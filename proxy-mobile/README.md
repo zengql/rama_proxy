@@ -324,7 +324,8 @@ tls connect failed
 - `START_STICKY`，进程被系统终止后允许 Android 重新创建 Kotlin 前台服务；当服务收到空 `intent` 时，会加载 native 库并通过 JNI 自动恢复 Rust SOCKS5。
 - 自动恢复读取应用数据目录中的 `resume.intent`、`client.toml` 和 `rama-proxy.log`。恢复期间界面显示“恢复中”，失败时通过 `restoreError` 显示原因。
 - Tauri 启动与 JNI 恢复共享同一份 Rust runtime 状态，并串行执行，避免重复绑定本地端口。
-- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按实际字节流量持有**：有代理流量读写时申请，最近一次字节传输结束 30 秒后释放；空闲连接（如 HTTP keep-alive 连接池）无数据流动时也会释放锁并允许手机睡眠，且超过 3 分钟无流量的空闲 TCP 代理连接会自动回收。
+- `PARTIAL_WAKE_LOCK` 与 `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi Lock **按实际字节流量持有**：有代理流量读写时申请，最近一次字节传输结束 10 秒后释放；空闲连接（如 HTTP keep-alive 连接池）无数据流动时也会释放锁并允许手机睡眠，且超过 3 分钟无流量的空闲 TCP 代理连接会自动回收。
+- **深度空闲单隧道常驻热备与网络切换秒级重连**：移动端默认关闭冗余的 60 秒独立心跳通道；无流量超过 3 分钟后连接池自动收缩为 **1 条已验证的在线热备隧道**（每 10 分钟低频保活一次，新请求到来时立即复用并扩容回 `poolSize`），并通过 Android `ConnectivityManager.NetworkCallback` 监听 Wi-Fi / 5G 网络切换与唤醒事件立即探测补池。既消除系统“后台频繁刷新（Frequently refreshes in the background）”的高耗电告警，又确保代理时刻有可用网络连接。
 - 通知渠道和电池优化豁免入口。必须加入电池优化白名单，否则 Doze 下后台网络会被切断。
 - 睡眠后首个请求会先探测空闲隧道，失效则重建，可能多一些延迟。
 
