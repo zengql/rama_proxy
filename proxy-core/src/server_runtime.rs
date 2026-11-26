@@ -1,19 +1,20 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use rama::{
+    dns::{DnsResolver, GlobalDnsResolver},
     extensions::Extensions,
     net::{
-        address::HostWithPort,
+        address::{Domain, HostWithPort},
         mode::{ConnectIpMode, DnsResolveIpMode},
-        stream::Socket,
     },
-    tcp::client::default_tcp_connect,
+    tcp::client::tcp_connect,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
-    sync::{OwnedSemaphorePermit, Semaphore, broadcast},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, error, info, warn};
 
@@ -33,7 +34,11 @@ use crate::{
 
 use std::time::{Duration, Instant};
 
+mod relay;
+
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const SLOW_TARGET_DIAL_MS: u64 = 500;
 const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const UDP_SELECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -59,15 +64,6 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
 
     loop {
         let (stream, peer) = accept_with_retry(&listener, &stats).await?;
-        let socket = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(
-                config.server.tcp_keepalive_secs.max(1),
-            ))
-            .with_interval(std::time::Duration::from_secs(
-                config.server.tcp_keepalive_secs.max(1),
-            ));
-        socket.set_tcp_keepalive(&keepalive)?;
         let config = config.clone();
         let tls_acceptor = tls_acceptor.clone();
         let stats = stats.clone();
@@ -145,6 +141,24 @@ fn is_retryable_accept_error(err: &std::io::Error) -> bool {
     ) || matches!(err.raw_os_error(), Some(24) | Some(10024))
 }
 
+fn configure_tcp_stream(
+    stream: &TcpStream,
+    keepalive_secs: u64,
+    connection_id: u64,
+    addr: SocketAddr,
+) {
+    if let Err(err) = stream.set_nodelay(true) {
+        warn!(connection_id, %addr, error = %err, "failed to enable TCP_NODELAY");
+    }
+    let interval = Duration::from_secs(keepalive_secs.max(1));
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(interval)
+        .with_interval(interval);
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        warn!(connection_id, %addr, error = %err, "failed to enable TCP keepalive");
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -153,44 +167,49 @@ async fn handle_connection(
     stats: ServerStatsRegistry,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError> {
-    stream.set_nodelay(true)?;
-    let connection_id = stats.register_connection(peer.to_string()).await;
+    let (connection_id, close) = stats.register_connection(peer.to_string()).await;
+    configure_tcp_stream(
+        &stream,
+        config.server.tcp_keepalive_secs,
+        connection_id,
+        peer,
+    );
     let started_at = Instant::now();
     info!(
         connection_id,
         client = %peer,
         "tunnel connection accepted"
     );
-    let close_rx = stats.subscribe_close();
-
     let result = match tls_acceptor {
         Some(acceptor) => {
-            let mut stream = acceptor.accept(stream);
-            let mut stream = tokio::time::timeout(
-                std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),
-                &mut stream,
-            )
-            .await
-            .map_err(|_| {
-                stats.record_handshake_timeout();
-                warn!(client = %peer, "tls handshake timed out");
-                AppError::Boxed("tls handshake timed out".to_string())
-            })?
-            .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
-            info!(
-                connection_id,
-                client = %peer,
-                "tls handshake completed"
-            );
-            handle_connection_io(
-                &mut stream,
-                peer,
-                config,
-                &stats,
-                connection_id,
-                close_rx,
-                handshake_permit,
-            )
+            async {
+                let mut stream = acceptor.accept(stream);
+                let mut stream = tokio::time::timeout(
+                    std::time::Duration::from_secs(config.server.handshake_timeout_secs.max(1)),
+                    &mut stream,
+                )
+                .await
+                .map_err(|_| {
+                    stats.record_handshake_timeout();
+                    AppError::Boxed("tls handshake timed out".to_string())
+                })?
+                .map_err(|err| AppError::Boxed(format!("tls accept failed: {err}")))?;
+                info!(
+                    connection_id,
+                    client = %peer,
+                    "tls handshake completed"
+                );
+                handle_connection_io(
+                    &mut stream,
+                    peer,
+                    config,
+                    &stats,
+                    connection_id,
+                    &close,
+                    handshake_permit,
+                )
+                .await
+            }
             .await
         }
         None => {
@@ -201,7 +220,7 @@ async fn handle_connection(
                 config,
                 &stats,
                 connection_id,
-                close_rx,
+                &close,
                 handshake_permit,
             )
             .await
@@ -233,7 +252,7 @@ async fn handle_connection_io<S>(
     config: ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
-    mut close_rx: broadcast::Receiver<u64>,
+    close: &Notify,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError>
 where
@@ -251,13 +270,9 @@ where
     .await
     .map_err(|_| {
         stats.record_handshake_timeout();
-        warn!(client = %peer, "tunnel handshake timed out");
         AppError::Boxed("tunnel handshake timed out".to_string())
     })?
-    .map_err(|err| {
-        warn!(client = %peer, error = %err, "tunnel handshake failed");
-        err
-    })?;
+    .map_err(|err| AppError::Boxed(format!("tunnel handshake failed: {err}")))?;
     drop(handshake_permit);
     stats.set_client_id(connection_id, client_id.clone()).await;
     stats.mark_idle(connection_id).await;
@@ -271,18 +286,13 @@ where
     loop {
         let opcode = tokio::select! {
             result = read_opcode(stream) => result?,
-            recv = close_rx.recv() => {
-                if let Ok(id) = recv {
-                    if id == connection_id {
-                        return Ok(());
-                    }
-                }
-                continue;
-            }
+            _ = close.notified() => return Ok(()),
         };
         if opcode_is_heartbeat_open(opcode) {
-            return serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id)
-                .await;
+            return tokio::select! {
+                _ = close.notified() => Ok(()),
+                result = serve_heartbeat_control(stream, peer, client_id, &config, stats, connection_id) => result,
+            };
         }
         if opcode_is_ping(opcode) {
             stats.touch(connection_id).await;
@@ -291,23 +301,15 @@ where
         }
         if opcode_is_connect(opcode) {
             let target = read_connect_target(stream).await?;
-            stats
-                .mark_active_tcp(connection_id, target.to_string())
-                .await;
-            return serve_tcp_tunnel(
-                stream,
-                peer,
-                target,
-                &config,
-                stats,
-                connection_id,
-                close_rx,
-            )
-            .await;
+            stats.mark_active_tcp(connection_id, target.clone()).await;
+            return tokio::select! {
+                _ = close.notified() => Ok(()),
+                result = serve_tcp_tunnel(stream, peer, target, &config, stats, connection_id) => result,
+            };
         }
         if opcode_is_udp(opcode) {
             stats.mark_active_udp(connection_id).await;
-            return serve_udp_tunnel(stream, peer, &config, stats, connection_id, close_rx).await;
+            return serve_udp_tunnel(stream, peer, &config, stats, connection_id, close).await;
         }
         error!(client = %peer, opcode, "received unknown tunnel opcode");
         return Err(AppError::InvalidConfig(format!(
@@ -329,7 +331,7 @@ where
 {
     if let Some(previous_id) = stats.register_heartbeat(&client_id, connection_id).await {
         if previous_id != connection_id {
-            stats.close_connection(previous_id);
+            stats.close_connection(previous_id).await;
         }
     }
     info!(
@@ -405,65 +407,70 @@ async fn serve_tcp_tunnel<S>(
     config: &ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
-    mut close_rx: broadcast::Receiver<u64>,
 ) -> Result<(), AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let extensions = build_outbound_extensions(&config.server.outbound_ip_mode)?;
+    let dns = TimedDnsResolver::default();
+    let started = Instant::now();
     let connect_result = tokio::time::timeout(
         OUTBOUND_CONNECT_TIMEOUT,
-        default_tcp_connect(&extensions, target.clone()),
+        tcp_connect(&extensions, target.clone(), dns.clone(), ()),
     )
     .await;
+    let ended = Instant::now();
+    let dial_ms = (ended - started).as_millis() as u64;
+    let dns_ms = |completion: &OnceLock<Instant>| {
+        completion
+            .get()
+            .filter(|finished| **finished <= ended)
+            .map(|finished| (*finished - started).as_millis() as u64)
+    };
+    let dns_ipv4_ms = dns_ms(&dns.0.ipv4);
+    let dns_ipv6_ms = dns_ms(&dns.0.ipv6);
     match connect_result {
-        Ok(Ok((upstream, _addr))) => {
-            if let Ok(addr) = upstream.peer_addr() {
-                stats
-                    .set_upstream_addr(connection_id, addr.to_string())
-                    .await;
+        Ok(Ok((upstream, addr))) => {
+            let dns_ms = if addr.is_ipv4() {
+                dns_ipv4_ms
+            } else {
+                dns_ipv6_ms
             }
-            write_response(tunnel, 0, "ok").await?;
-            let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
-            let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
-            let result = tokio::select! {
-                tunnel_to_upstream = tokio::io::copy(&mut tunnel_reader, &mut upstream_writer) => {
-                    let _ = upstream_writer.shutdown().await;
-                    let _ = tunnel_writer.shutdown().await;
-                    tunnel_to_upstream.map(|bytes| (bytes, 0))
-                }
-                upstream_to_tunnel = tokio::io::copy(&mut upstream_reader, &mut tunnel_writer) => {
-                    let _ = tunnel_writer.shutdown().await;
-                    let _ = upstream_writer.shutdown().await;
-                    upstream_to_tunnel.map(|bytes| (0, bytes))
-                }
-                recv = close_rx.recv() => {
-                    match recv {
-                        Ok(id) if id == connection_id => Ok((0, 0)),
-                        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "connection closed by server")),
-                    }
-                }
+            .unwrap_or(0);
+            // Time after the winning address family's lookup, including scheduling and retries.
+            let tcp_phase_ms = dial_ms.saturating_sub(dns_ms);
+            if dial_ms >= SLOW_TARGET_DIAL_MS {
+                info!(target: "proxy_core::server_runtime::dial", connection_id, target = %target, upstream = %addr, dns_ms, tcp_phase_ms, dial_ms, "Target connected");
+            } else {
+                debug!(target: "proxy_core::server_runtime::dial", connection_id, target = %target, upstream = %addr, dns_ms, tcp_phase_ms, dial_ms, "Target connected");
+            }
+            let mut upstream = upstream.stream;
+            configure_tcp_stream(
+                &upstream,
+                config.server.tcp_keepalive_secs,
+                connection_id,
+                addr,
+            );
+            stats.set_upstream_addr(connection_id, addr).await;
+            // Older clients consume and ignore the successful response message.
+            let message = format!("ok id={connection_id} dial_ms={dial_ms}");
+            write_response(tunnel, 0, &message).await?;
+            let Some((up_bytes, down_bytes)) =
+                relay::copy_with_idle_timeout(tunnel, &mut upstream, TCP_RELAY_IDLE_TIMEOUT)
+                    .await?
+            else {
+                debug!(connection_id, target = %target, idle_timeout_secs = TCP_RELAY_IDLE_TIMEOUT.as_secs(), "tcp tunnel idle timeout reached");
+                return Ok(());
             };
-            match result {
-                Ok((up_bytes, down_bytes)) => {
-                    stats
-                        .add_tcp_bytes(connection_id, up_bytes, down_bytes)
-                        .await;
-                    debug!(
-                        client = %peer,
-                        target = %target,
-                        up_bytes,
-                        down_bytes,
-                        "tcp tunnel finished"
-                    );
-                    Ok(())
-                }
-                Err(err) => Err(AppError::Io(err)),
-            }
+            stats
+                .add_tcp_bytes(connection_id, up_bytes, down_bytes)
+                .await;
+            debug!(connection_id, client = %peer, target = %target, up_bytes, down_bytes, "tcp tunnel finished");
+            Ok(())
         }
         Ok(Err(err)) => {
             let (status, message) = status_connect_failed(&err.to_string());
-            warn!(client = %peer, target = %target, error = %err, "connect target failed");
+            warn!(connection_id, target = %target, dial_ms, dns_ipv4_ms, dns_ipv6_ms, error = %err, "Target connection failed");
             write_response(tunnel, status, &message).await?;
             Err(AppError::Boxed(format!(
                 "connect target {target} failed: {err}"
@@ -474,7 +481,7 @@ where
                 "connect target {target} timed out after {}s",
                 OUTBOUND_CONNECT_TIMEOUT.as_secs()
             );
-            warn!(client = %peer, target = %target, timeout_secs = OUTBOUND_CONNECT_TIMEOUT.as_secs(), "outbound tcp connect timed out");
+            warn!(connection_id, target = %target, dial_ms, dns_ipv4_ms, dns_ipv6_ms, "Target connection timed out");
             let (status, response_message) = status_connect_failed(&message);
             write_response(tunnel, status, &response_message).await?;
             Err(AppError::Boxed(message))
@@ -488,7 +495,7 @@ async fn serve_udp_tunnel<S>(
     config: &ServerConfigFile,
     stats: &ServerStatsRegistry,
     connection_id: u64,
-    mut close_rx: broadcast::Receiver<u64>,
+    close: &Notify,
 ) -> Result<(), AppError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -534,10 +541,7 @@ where
                     };
                     let remote = resolve_udp_target(&target, &config.server.outbound_ip_mode).await?;
                     stats
-                        .add_udp_client_bytes(connection_id, target.to_string(), payload.len() as u64)
-                        .await;
-                    stats
-                        .set_upstream_addr(connection_id, remote.to_string())
+                        .add_udp_client_bytes(connection_id, target, remote, payload.len() as u64)
                         .await;
                     udp.send_to(&payload, remote).await?;
                     last_activity = std::time::Instant::now();
@@ -562,7 +566,7 @@ where
                 let (n, remote) = recv?;
                 let source = HostWithPort::from(remote);
                 stats
-                    .add_udp_target_bytes(connection_id, remote.to_string(), n as u64)
+                    .add_udp_target_bytes(connection_id, remote, n as u64)
                     .await;
                 write_udp_packet(tunnel, &source, &recv_buf[..n]).await?;
                 last_activity = std::time::Instant::now();
@@ -581,15 +585,40 @@ where
                     write_ping(tunnel).await?;
                 }
             }
-            recv = close_rx.recv() => {
-                if let Ok(id) = recv {
-                    if id == connection_id {
-                        let _ = write_close(tunnel).await;
-                        return Ok(());
-                    }
-                }
+            _ = close.notified() => {
+                let _ = write_close(tunnel).await;
+                return Ok(());
             }
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TimedDnsResolver(Arc<DnsCompletion>);
+
+#[derive(Default)]
+struct DnsCompletion {
+    ipv4: OnceLock<Instant>,
+    ipv6: OnceLock<Instant>,
+}
+
+impl DnsResolver for TimedDnsResolver {
+    type Error = <GlobalDnsResolver as DnsResolver>::Error;
+
+    async fn ipv4_lookup(&self, domain: Domain) -> Result<Vec<Ipv4Addr>, Self::Error> {
+        let result = GlobalDnsResolver::new().ipv4_lookup(domain).await;
+        let _ = self.0.ipv4.set(Instant::now());
+        result
+    }
+
+    async fn ipv6_lookup(&self, domain: Domain) -> Result<Vec<Ipv6Addr>, Self::Error> {
+        let result = GlobalDnsResolver::new().ipv6_lookup(domain).await;
+        let _ = self.0.ipv6.set(Instant::now());
+        result
+    }
+
+    async fn txt_lookup(&self, domain: Domain) -> Result<Vec<Vec<u8>>, Self::Error> {
+        GlobalDnsResolver::new().txt_lookup(domain).await
     }
 }
 
@@ -634,3 +663,6 @@ fn parse_bind_ip(bind: &str) -> Result<IpAddr, AppError> {
     bind.parse()
         .map_err(|_| AppError::InvalidConfig("bind must be a valid IP address".to_string()))
 }
+
+#[cfg(test)]
+mod tests;

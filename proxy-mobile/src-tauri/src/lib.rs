@@ -272,6 +272,9 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .compact()
         .with_writer(MemoryLogMakeWriter)
         .try_init();
 }

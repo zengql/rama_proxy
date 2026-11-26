@@ -123,6 +123,8 @@ pub type TunnelStream = Box<dyn TunnelIo>;
 
 pub struct TunnelLease {
     inner: TunnelStream,
+    id: u64,
+    from_pool: bool,
     active: Arc<AtomicUsize>,
     last_traffic_unix_ms: Arc<AtomicU64>,
     state_notify: Arc<Notify>,
@@ -518,6 +520,8 @@ impl TunnelPool {
             self.schedule_refill().await;
             return Ok(TunnelLease {
                 inner: idle_tunnel.stream,
+                id: idle_tunnel.tunnel_id,
+                from_pool: true,
                 active: self.active.clone(),
                 last_traffic_unix_ms: self.last_traffic_unix_ms.clone(),
                 state_notify: self.state_notify.clone(),
@@ -579,6 +583,8 @@ impl TunnelPool {
         self.record_traffic_start();
         Ok(TunnelLease {
             inner: stream,
+            id: tunnel_id,
+            from_pool: false,
             active: self.active.clone(),
             last_traffic_unix_ms: self.last_traffic_unix_ms.clone(),
             state_notify: self.state_notify.clone(),
@@ -709,6 +715,10 @@ async fn probe_idle_tunnel(stream: &mut TunnelStream) -> Result<(), AppError> {
 }
 
 impl TunnelLease {
+    pub(crate) fn log_context(&self) -> (u64, &'static str) {
+        (self.id, if self.from_pool { "warm" } else { "cold" })
+    }
+
     fn touch_traffic(&self) {
         self.last_traffic_unix_ms
             .store(unix_now_millis(), Ordering::Relaxed);
@@ -775,57 +785,49 @@ async fn connect_idle_tunnel(
         timeout_secs = connect_timeout.as_secs(),
         "tcp tunnel dial started"
     );
+    let started = Instant::now();
     let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(server_addr))
         .await
-        .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))??;
+        .map_err(|_| AppError::InvalidConfig("client tunnel connect timed out".to_string()))
+        .and_then(|result| result.map_err(AppError::Io))
+        .inspect_err(|err| {
+            warn!(tunnel_id, purpose, stage = "tcp", elapsed_ms = started.elapsed().as_millis() as u64, error = %err, "Rama tunnel setup failed");
+        })?;
+    let tcp_ms = started.elapsed().as_millis() as u64;
     stream.set_nodelay(true)?;
     let socket = socket2::SockRef::from(&stream);
     let keepalive =
         socket2::TcpKeepalive::new().with_time(Duration::from_secs(TUNNEL_TCP_KEEPALIVE_SECS));
     let _ = socket.set_tcp_keepalive(&keepalive);
-    let tls_backend = tls.as_ref().map(|tls| tls.backend).unwrap_or("plain");
-    let tls_server_name = tls
-        .as_ref()
-        .map(|tls| tls.server_name_display.clone())
-        .unwrap_or_default();
-    let client_auth_configured = tls
-        .as_ref()
-        .map(|tls| tls.client_auth_configured)
-        .unwrap_or(false);
-    debug!(
-        tunnel_id,
-        purpose,
-        server_addr = %server_addr,
-        "tcp tunnel dial completed"
-    );
-    let mut stream: TunnelStream = match tls {
-        Some(tls) => Box::new(
-            tls.connector
-                .connect(tls.server_name, stream)
-                .await
-                .map_err(|err| AppError::Boxed(format!("tls connect failed: {err}")))?,
-        ),
-        None => Box::new(stream),
+
+    let tls_started = Instant::now();
+    let (mut stream, tls_ms): (TunnelStream, u64) = match tls {
+        Some(tls) => {
+            let result = tls.connector.connect(tls.server_name, stream).await;
+            let elapsed_ms = tls_started.elapsed().as_millis() as u64;
+            let stream = result.map_err(|err| {
+                warn!(tunnel_id, purpose, stage = "tls", elapsed_ms, error = %err, "Rama tunnel setup failed");
+                AppError::Boxed(format!("tls connect failed: {err}"))
+            })?;
+            (Box::new(stream), elapsed_ms)
+        }
+        None => (Box::new(stream), 0),
     };
-    debug!(
-        tunnel_id,
-        purpose, tls_backend, tls_server_name, "tunnel tls stage completed"
-    );
-    client_handshake(&mut stream, shared_secret, client_id).await?;
-    debug!(
-        tunnel_id,
-        purpose, client_id, "tunnel authentication completed"
-    );
+    let auth_started = Instant::now();
+    let auth_result = client_handshake(&mut stream, shared_secret, client_id).await;
+    let auth_ms = auth_started.elapsed().as_millis() as u64;
+    auth_result.inspect_err(|err| {
+        warn!(tunnel_id, purpose, stage = "auth", elapsed_ms = auth_ms, error = %err, "Rama tunnel setup failed");
+    })?;
     info!(
         tunnel_id,
         purpose,
-        server_addr = %server_addr,
-        client_id,
-        tls_enabled = tls_backend != "plain",
-        tls_backend,
-        tls_server_name,
-        client_auth_configured,
-        "fresh tunnel connection is ready"
+        server = %server_addr,
+        tcp_ms,
+        tls_ms,
+        auth_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        "Rama tunnel ready"
     );
     Ok(stream)
 }
@@ -1016,6 +1018,13 @@ pub async fn read_response<R>(reader: &mut R) -> Result<(), AppError>
 where
     R: AsyncRead + Unpin,
 {
+    read_response_message(reader).await.map(|_| ())
+}
+
+pub(crate) async fn read_response_message<R>(reader: &mut R) -> Result<String, AppError>
+where
+    R: AsyncRead + Unpin,
+{
     let opcode = reader.read_u8().await?;
     if opcode != OP_RESPONSE {
         return Err(AppError::InvalidConfig(format!(
@@ -1025,7 +1034,7 @@ where
     let status = reader.read_u8().await?;
     let message = read_string(reader).await?;
     if status == STATUS_OK {
-        Ok(())
+        Ok(message)
     } else {
         Err(AppError::InvalidConfig(format!(
             "tunnel server rejected request: {message}"

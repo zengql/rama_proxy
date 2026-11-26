@@ -3,6 +3,7 @@ mod client_runtime;
 mod config;
 mod error;
 mod http_connect_runtime;
+mod local_listener;
 mod logging;
 mod server_runtime;
 mod server_stats;

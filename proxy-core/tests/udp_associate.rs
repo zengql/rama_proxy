@@ -169,7 +169,7 @@ fn tcp_pool_warms_without_udp_associate() -> Result<(), Box<dyn Error>> {
             .any(|line| line.contains(&expected_count));
 
         if created >= POOL_SIZE && snapshot_has_pool {
-            return Ok(());
+            break;
         }
         if Instant::now() >= deadline {
             panic!(
@@ -178,6 +178,52 @@ fn tcp_pool_warms_without_udp_associate() -> Result<(), Box<dyn Error>> {
         }
         thread::sleep(Duration::from_millis(100));
     }
+
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let upstream_addr = upstream.local_addr()?;
+    let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, socks5_port))?;
+    control.set_read_timeout(Some(IO_TIMEOUT))?;
+    control.write_all(&[0x05, 0x01, 0x00])?;
+    let mut handshake = [0; 2];
+    control.read_exact(&mut handshake)?;
+    assert_eq!(handshake, [0x05, 0x00]);
+    let mut connect = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    connect.extend_from_slice(&upstream_addr.port().to_be_bytes());
+    control.write_all(&connect)?;
+    let mut reply = [0; 10];
+    control.read_exact(&mut reply)?;
+    assert_eq!(reply[..2], [0x05, 0x00]);
+
+    let client_logs = client.logs();
+    let connected = client_logs
+        .lines()
+        .find(|line| line.contains("SOCKS5 CONNECT ready"))
+        .expect("client should log successful CONNECT");
+    assert!(
+        connected.split_ascii_whitespace().any(|field| {
+            field
+                .strip_prefix("pool=")
+                .is_some_and(|value| value.trim_matches('"') == "warm")
+        }),
+        "{connected}"
+    );
+    for field in ["acquire_ms=", "open_ms=", "target_dial_ms="] {
+        assert!(connected.contains(field), "missing {field} in {connected}");
+    }
+    let id = connected
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("server_connection_id="))
+        .expect("client should receive server connection ID");
+    let server_logs = server.logs();
+    assert!(server_logs.lines().any(|line| {
+        line.contains("Target connected")
+            && line.contains("dns_ms=")
+            && line.contains("tcp_phase_ms=")
+            && line
+                .split_ascii_whitespace()
+                .any(|field| field.strip_prefix("connection_id=") == Some(id))
+    }));
+    Ok(())
 }
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
@@ -324,7 +370,7 @@ require_client_id = false
 enabled = false
 
 [log]
-level = "info"
+level = "info,proxy_core::server_runtime::dial=debug"
 format = "text"
 "#
     );

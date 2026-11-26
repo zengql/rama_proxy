@@ -14,7 +14,7 @@ use std::{
 use std::os::windows::process::CommandExt as _;
 
 use gpui_kit::component::{
-    IconName, Root, Selectable as _, StyledExt as _,
+    Disableable as _, IconName, Root, Selectable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -23,10 +23,10 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder as _, px, rgb,
-    size,
+    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, WindowBounds, WindowOptions, div,
+    prelude::FluentBuilder as _, px, rgb, size,
 };
 use proxy_core::config::{
     ClientConfigFile, ClientTlsConfig, LocalAuthConfig, LocalHttpConnectConfig, LocalSocks5Config,
@@ -781,15 +781,7 @@ impl ClientView {
         let clear_view = settings_view.clone();
         let follow_view = settings_view.clone();
         let manual_scroll_view = settings_view.clone();
-        let console_text = if self.console_lines.is_empty() {
-            "No console output.".to_string()
-        } else {
-            self.console_lines
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let copy_view = settings_view.clone();
         let header = h_flex()
             .w_full()
             .justify_between()
@@ -865,91 +857,127 @@ impl ClientView {
                         });
                     })
             });
-        let console = v_flex()
-            .flex_1()
-            .min_h_0()
-            .gap_3()
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_lg().font_semibold().child("Console"))
-                            .child(div().text_sm().text_color(rgb(0x63706a)).child(format!(
-                                "{} / {} lines",
-                                self.console_lines.len(),
-                                self.settings.console_max_lines
-                            ))),
-                    )
-                    .child(
-                        Button::new("follow-console")
-                            .flex_none()
-                            .icon(IconName::ChevronDown)
-                            .label("Follow latest")
-                            .tooltip("Toggle automatic scrolling to the newest console output")
-                            .selected(self.follow_console)
-                            .on_click(move |_, _, cx| {
-                                follow_view.update(cx, |state, cx| {
-                                    state.follow_console = !state.follow_console;
-                                    if state.follow_console {
-                                        state.console_scroll_handle.scroll_to_bottom();
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("clear-console")
-                            .flex_none()
-                            .icon(IconName::Delete)
-                            .label("Clear")
-                            .tooltip("Clear console")
-                            .on_click(move |_, _, cx| {
-                                clear_view.update(cx, |state, cx| {
-                                    state.console_lines.clear();
-                                    state.console_bytes = 0;
-                                    if state.follow_console {
-                                        state.console_scroll_handle.scroll_to_bottom();
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("console-scroll")
-                    .track_scroll(&self.console_scroll_handle)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .overflow_scrollbar()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(rgb(0x243a32))
-                    .bg(rgb(0x10221c))
-                    .p_4()
-                    .font_family("Consolas")
-                    .text_sm()
-                    .text_color(rgb(0xc8ded4))
-                    .whitespace_normal()
-                    .on_scroll_wheel(move |_, _, cx| {
-                        manual_scroll_view.update(cx, |state, cx| {
-                            if state.follow_console {
-                                state.follow_console = false;
-                                cx.notify();
-                            }
-                        });
-                    })
-                    .child(SharedString::from(console_text)),
-            );
+        let console =
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .flex_wrap()
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w(px(112.))
+                                .items_center()
+                                .gap_2()
+                                .child(div().text_lg().font_semibold().child("Console"))
+                                .child(div().text_sm().text_color(rgb(0x63706a)).child(format!(
+                                    "{} / {} lines",
+                                    self.console_lines.len(),
+                                    self.settings.console_max_lines
+                                ))),
+                        )
+                        .child(
+                            Button::new("follow-console")
+                                .flex_none()
+                                .icon(IconName::ChevronDown)
+                                .label("Follow latest")
+                                .tooltip("Toggle automatic scrolling to the newest console output")
+                                .selected(self.follow_console)
+                                .on_click(move |_, _, cx| {
+                                    follow_view.update(cx, |state, cx| {
+                                        state.follow_console = !state.follow_console;
+                                        if state.follow_console {
+                                            state.console_scroll_handle.scroll_to_bottom();
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("copy-console")
+                                .flex_none()
+                                .label("Copy logs")
+                                .tooltip("Copy all retained log lines")
+                                .disabled(self.console_lines.is_empty())
+                                .on_click(move |_, _, cx| {
+                                    let text = copy_view
+                                        .read(cx)
+                                        .console_lines
+                                        .iter()
+                                        .map(String::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                }),
+                        )
+                        .child(
+                            Button::new("clear-console")
+                                .flex_none()
+                                .icon(IconName::Delete)
+                                .label("Clear")
+                                .tooltip("Clear console")
+                                .on_click(move |_, _, cx| {
+                                    clear_view.update(cx, |state, cx| {
+                                        state.console_lines.clear();
+                                        state.console_bytes = 0;
+                                        state.console_scroll_handle = ScrollHandle::new();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgb(0x243a32))
+                        .bg(rgb(0x10221c))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("console-scroll")
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .flex_col()
+                                .track_scroll(&self.console_scroll_handle)
+                                .overflow_y_scroll()
+                                .vertical_scrollbar(&self.console_scroll_handle)
+                                .font_family("Consolas")
+                                .text_sm()
+                                .text_color(rgb(0xc8ded4))
+                                .on_scroll_wheel(move |_, _, cx| {
+                                    manual_scroll_view.update(cx, |state, cx| {
+                                        if state.follow_console {
+                                            state.follow_console = false;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                                .child(
+                                    v_flex()
+                                        .flex_none()
+                                        .w_full()
+                                        .px_4()
+                                        .py_3()
+                                        .when(self.console_lines.is_empty(), |view| {
+                                            view.child("No console output.")
+                                        })
+                                        .children(self.console_lines.iter().map(|line| {
+                                            div().child(SharedString::from(line.clone()))
+                                        })),
+                                ),
+                        ),
+                );
         v_flex()
             .absolute()
             .top(px(24.))

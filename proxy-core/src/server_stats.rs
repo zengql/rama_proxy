@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -9,8 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 const STATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+use rama::net::address::HostWithPort;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock};
 
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,7 +25,6 @@ pub struct ServerStatsRegistry {
     next_id: Arc<AtomicU64>,
     connections: Arc<RwLock<HashMap<u64, LiveConnection>>>,
     heartbeat_by_client: Arc<RwLock<HashMap<String, u64>>>,
-    close_tx: broadcast::Sender<u64>,
     handshake_timeouts: Arc<AtomicU64>,
     handshake_rejections: Arc<AtomicU64>,
     emfile_events: Arc<AtomicU64>,
@@ -31,23 +32,23 @@ pub struct ServerStatsRegistry {
 
 impl ServerStatsRegistry {
     pub fn new() -> Self {
-        let (close_tx, _) = broadcast::channel(1024);
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
             connections: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_by_client: Arc::new(RwLock::new(HashMap::new())),
-            close_tx,
             handshake_timeouts: Arc::new(AtomicU64::new(0)),
             handshake_rejections: Arc::new(AtomicU64::new(0)),
             emfile_events: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub async fn register_connection(&self, client_addr: String) -> u64 {
+    pub async fn register_connection(&self, client_addr: String) -> (u64, Arc<Notify>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now = now_unix_secs();
+        let close = Arc::new(Notify::new());
         let entry = LiveConnection {
             id,
+            close: close.clone(),
             client_id: String::new(),
             client_addr,
             state: "handshake".to_string(),
@@ -60,12 +61,12 @@ impl ServerStatsRegistry {
             in_use: false,
         };
         self.connections.write().await.insert(id, entry);
-        id
+        (id, close)
     }
 
     pub async fn set_client_id(&self, id: u64, client_id: String) {
         self.update(id, |entry| {
-            entry.client_id = client_id.clone();
+            entry.client_id = client_id;
             entry.last_active_unix_secs = now_unix_secs();
         })
         .await;
@@ -80,10 +81,10 @@ impl ServerStatsRegistry {
         .await;
     }
 
-    pub async fn mark_active_tcp(&self, id: u64, target_addr: String) {
+    pub async fn mark_active_tcp(&self, id: u64, target_addr: HostWithPort) {
         self.update(id, |entry| {
             entry.state = "active-tcp".to_string();
-            entry.target_addr = Some(target_addr.clone());
+            entry.target_addr = Some(target_addr);
             entry.in_use = true;
             entry.last_active_unix_secs = now_unix_secs();
         })
@@ -99,9 +100,9 @@ impl ServerStatsRegistry {
         .await;
     }
 
-    pub async fn set_upstream_addr(&self, id: u64, upstream_addr: String) {
+    pub async fn set_upstream_addr(&self, id: u64, upstream_addr: SocketAddr) {
         self.update(id, |entry| {
-            entry.upstream_addr = Some(upstream_addr.clone());
+            entry.upstream_addr = Some(upstream_addr);
             entry.last_active_unix_secs = now_unix_secs();
         })
         .await;
@@ -123,22 +124,25 @@ impl ServerStatsRegistry {
         .await;
     }
 
-    pub async fn add_udp_client_bytes(&self, id: u64, target_addr: String, bytes: u64) {
+    pub async fn add_udp_client_bytes(
+        &self,
+        id: u64,
+        target_addr: HostWithPort,
+        upstream_addr: SocketAddr,
+        bytes: u64,
+    ) {
         self.update(id, |entry| {
-            entry.state = "active-udp".to_string();
-            entry.target_addr = Some(target_addr.clone());
-            entry.in_use = true;
+            entry.target_addr = Some(target_addr);
+            entry.upstream_addr = Some(upstream_addr);
             entry.bytes_from_client = entry.bytes_from_client.saturating_add(bytes);
             entry.last_active_unix_secs = now_unix_secs();
         })
         .await;
     }
 
-    pub async fn add_udp_target_bytes(&self, id: u64, upstream_addr: String, bytes: u64) {
+    pub async fn add_udp_target_bytes(&self, id: u64, upstream_addr: SocketAddr, bytes: u64) {
         self.update(id, |entry| {
-            entry.state = "active-udp".to_string();
-            entry.upstream_addr = Some(upstream_addr.clone());
-            entry.in_use = true;
+            entry.upstream_addr = Some(upstream_addr);
             entry.bytes_from_target = entry.bytes_from_target.saturating_add(bytes);
             entry.last_active_unix_secs = now_unix_secs();
         })
@@ -165,26 +169,22 @@ impl ServerStatsRegistry {
             .insert(client_id.to_string(), id)
     }
 
-    pub fn close_connection(&self, id: u64) {
-        let _ = self.close_tx.send(id);
+    pub async fn close_connection(&self, id: u64) {
+        if let Some(entry) = self.connections.read().await.get(&id) {
+            entry.close.notify_one();
+        }
     }
 
     pub async fn close_client_connection_if_exists(&self, client_id: &str, id: u64) -> bool {
-        let belongs_to_client = self
-            .connections
-            .read()
-            .await
+        let connections = self.connections.read().await;
+        let Some(entry) = connections
             .get(&id)
-            .is_some_and(|entry| entry.client_id == client_id && entry.state != "heartbeat");
-        if !belongs_to_client {
+            .filter(|entry| entry.client_id == client_id && entry.state != "heartbeat")
+        else {
             return false;
-        }
-        self.close_connection(id);
+        };
+        entry.close.notify_one();
         true
-    }
-
-    pub fn subscribe_close(&self) -> broadcast::Receiver<u64> {
-        self.close_tx.subscribe()
     }
 
     pub async fn mark_heartbeat(&self, id: u64) {
@@ -221,8 +221,13 @@ impl ServerStatsRegistry {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub async fn snapshot(&self) -> ServerStatsSnapshot {
         let now = now_unix_secs();
-        let connections = self.connections.read().await;
-        let mut items = connections.values().cloned().collect::<Vec<_>>();
+        let mut items = self
+            .connections
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         items.sort_by_key(|item| item.id);
 
         let mut summary = ServerStatsSummary::default();
@@ -263,8 +268,8 @@ impl ServerStatsRegistry {
                     last_active_unix_secs: item.last_active_unix_secs,
                     age_secs: now.saturating_sub(item.accepted_at_unix_secs),
                     idle_secs: now.saturating_sub(item.last_active_unix_secs),
-                    target_addr: item.target_addr,
-                    upstream_addr: item.upstream_addr,
+                    target_addr: item.target_addr.map(|addr| addr.to_string()),
+                    upstream_addr: item.upstream_addr.map(|addr| addr.to_string()),
                     bytes_from_client: item.bytes_from_client,
                     bytes_from_target: item.bytes_from_target,
                     in_use: item.in_use,
@@ -273,9 +278,9 @@ impl ServerStatsRegistry {
         }
     }
 
-    async fn update<F>(&self, id: u64, mut f: F)
+    async fn update<F>(&self, id: u64, f: F)
     where
-        F: FnMut(&mut LiveConnection),
+        F: FnOnce(&mut LiveConnection),
     {
         if let Some(entry) = self.connections.write().await.get_mut(&id) {
             f(entry);
@@ -335,13 +340,14 @@ pub struct ConnectionSnapshot {
 #[derive(Debug, Clone)]
 struct LiveConnection {
     id: u64,
+    close: Arc<Notify>,
     client_id: String,
     client_addr: String,
     state: String,
     accepted_at_unix_secs: u64,
     last_active_unix_secs: u64,
-    target_addr: Option<String>,
-    upstream_addr: Option<String>,
+    target_addr: Option<HostWithPort>,
+    upstream_addr: Option<SocketAddr>,
     bytes_from_client: u64,
     bytes_from_target: u64,
     in_use: bool,

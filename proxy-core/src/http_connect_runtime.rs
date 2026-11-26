@@ -4,13 +4,14 @@ use std::str;
 use rama::net::address::{Host, HostWithPort};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::TcpStream,
 };
 use tracing::{info, warn};
 
 use crate::{
     config::{ClientConfigFile, LocalAuthConfig},
     error::AppError,
+    local_listener::bind_local_listener,
 };
 
 const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
@@ -24,7 +25,7 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
 
     let bind_ip = parse_bind_ip(&config.http_connect.bind)?;
     let listen_addr = SocketAddr::new(bind_ip, http_port);
-    let listener = bind_listener(listen_addr).await?;
+    let listener = bind_local_listener(listen_addr)?;
     let socks5_addr = resolve_local_socks5_upstream_addr(&config.socks5.bind, config.socks5.port)?;
 
     info!(
@@ -42,16 +43,6 @@ pub async fn run(config: ClientConfigFile) -> Result<(), AppError> {
             }
         });
     }
-}
-
-async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, AppError> {
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    Ok(socket.listen(4096)?)
 }
 
 async fn handle_session(

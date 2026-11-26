@@ -1,4 +1,4 @@
-rama-proxy v1.3.0 (Windows 客户端 GUI 版)
+Rama Proxy (Windows 客户端 GUI 版)
 =========================================
 
 文件说明
@@ -28,7 +28,12 @@ Settings -> Application -> Close button behavior：
 托盘说明
 --------
 - 托盘图标失效时（例如 Windows Explorer 重启），程序会自动重建托盘，并在界面顶部提示。
-- 控制台输出区可勾选 Follow latest 自动跟随最新日志；手动滚动后会自动取消跟随。
+- 控制台支持滚轮和滚动条。Follow latest 会跟随最新日志，手动滚动后退出跟随。
+- Copy logs 会复制当前保留的全部日志。
+- SOCKS5 CONNECT 行里的 pool 表示使用预热隧道（warm）或现场新建（cold）。
+  acquire_ms 是取隧道时间，open_ms 是等待代理连上目标的时间。
+  新版服务端还会返回 target_dial_ms，表示服务端解析并连接目标的耗时。
+  Rama tunnel ready 会分别记录代理隧道的 TCP、TLS 和认证耗时。
 
 
 命令行（proxy-core.exe，可选）

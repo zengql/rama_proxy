@@ -10,6 +10,8 @@ pub fn init(level: &str) -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
+        .with_target(false)
+        .compact()
         .init();
     Ok(())
 }

@@ -11,19 +11,20 @@ use rama::{
 };
 use tokio::{
     io::copy,
-    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
 };
 use tracing::{debug, info, warn};
 
 use crate::{
     config::{ClientConfigFile, UserConfig},
     error::AppError,
+    local_listener::bind_local_listener,
     tls::build_client_tls_context,
     tunnel::{
         TunnelPool, TunnelPoolSnapshot, opcode_is_close, opcode_is_ping, opcode_is_pong,
-        opcode_is_udp_packet, read_opcode, read_response, read_udp_packet, resolve_client_id,
-        run_heartbeat, write_close, write_open_connect, write_open_udp, write_ping, write_pong,
-        write_udp_packet,
+        opcode_is_udp_packet, read_opcode, read_response, read_response_message, read_udp_packet,
+        resolve_client_id, run_heartbeat, write_close, write_open_connect, write_open_udp,
+        write_ping, write_pong, write_udp_packet,
     },
 };
 
@@ -86,7 +87,7 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
     let prepared = async {
         let bind_ip = parse_bind_ip(&config.socks5.bind)?;
         let listen_addr = SocketAddr::new(bind_ip, config.socks5.port);
-        let listener = bind_listener(listen_addr).await?;
+        let listener = bind_local_listener(listen_addr)?;
         let tls = build_client_tls_context(&config.tls)?;
         let pool = TunnelPool::new(&config.client, tls)?;
         Ok::<_, AppError>((listen_addr, listener, pool))
@@ -293,16 +294,6 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
     result
 }
 
-async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, AppError> {
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    Ok(socket.listen(4096)?)
-}
-
 async fn handle_client(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -425,31 +416,50 @@ async fn serve_connect(
     destination: HostWithPort,
     pool: &TunnelPool,
 ) -> Result<(), AppError> {
+    let started = Instant::now();
     let mut tunnel = tokio::time::timeout(TUNNEL_ACQUIRE_TIMEOUT, pool.acquire())
         .await
-        .map_err(|_| AppError::Boxed(format!(
-            "acquire tunnel timed out for {peer} -> {destination}"
-        )))?
-        .map_err(|err| {
-            warn!(client = %peer, destination = %destination, error = %err, "acquire tunnel failed");
-            err
+        .map_err(|_| AppError::Boxed(format!("acquire tunnel timed out for {peer} -> {destination}")))
+        .and_then(|result| result)
+        .inspect_err(|err| {
+            warn!(target = %destination, acquire_ms = started.elapsed().as_millis() as u64, error = %err, "SOCKS5 tunnel acquire failed");
         })?;
-    write_open_connect(&mut tunnel, &destination).await?;
-    if let Err(err) = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel))
-        .await
-        .map_err(|_| {
-            AppError::Boxed(format!(
-                "wait tunnel open response timed out for {peer} -> {destination}"
-            ))
-        })?
-    {
-        warn!(client = %peer, destination = %destination, error = %err, "tunnel open connect failed");
-        server::Reply::error_reply(ReplyKind::GeneralServerFailure)
-            .write_to(&mut stream)
-            .await?;
-        return Err(err);
+    let acquire_ms = started.elapsed().as_millis() as u64;
+    let (tunnel_id, source) = tunnel.log_context();
+    let open_started = Instant::now();
+    write_open_connect(&mut tunnel, &destination).await.inspect_err(|err| {
+        warn!(target = %destination, tunnel_id, pool = source, acquire_ms, open_ms = open_started.elapsed().as_millis() as u64, error = %err, "SOCKS5 CONNECT write failed");
+    })?;
+    let response =
+        tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response_message(&mut tunnel)).await;
+    let open_ms = open_started.elapsed().as_millis() as u64;
+    let total_ms = started.elapsed().as_millis() as u64;
+    let message = match response {
+        Ok(Ok(message)) => message,
+        Ok(Err(err)) => {
+            warn!(target = %destination, tunnel_id, pool = source, acquire_ms, open_ms, total_ms, error = %err, "SOCKS5 CONNECT rejected");
+            server::Reply::error_reply(ReplyKind::GeneralServerFailure)
+                .write_to(&mut stream)
+                .await?;
+            return Err(err);
+        }
+        Err(_) => {
+            warn!(target = %destination, tunnel_id, pool = source, acquire_ms, open_ms, total_ms, "SOCKS5 CONNECT timed out");
+            return Err(AppError::Boxed(format!(
+                "tunnel CONNECT timed out for {peer} -> {destination}"
+            )));
+        }
+    };
+    let mut server_connection_id = None;
+    let mut target_dial_ms = None;
+    for field in message.split_ascii_whitespace() {
+        if let Some(id) = field.strip_prefix("id=") {
+            server_connection_id = id.parse::<u64>().ok();
+        } else if let Some(ms) = field.strip_prefix("dial_ms=") {
+            target_dial_ms = ms.parse::<u64>().ok();
+        }
     }
-    debug!(client = %peer, destination = %destination, "tcp tunnel connected");
+    info!(target = %destination, tunnel_id, pool = source, acquire_ms, open_ms, target_dial_ms, server_connection_id, total_ms, "SOCKS5 CONNECT ready");
 
     server::Reply::new(HostWithPort::default_ipv4(0))
         .write_to(&mut stream)

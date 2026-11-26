@@ -3,12 +3,12 @@
 - 发布日期：2026-11-21
 - 版本：v1.4.2（上一版本 v1.4.1 / Android versionCode 1401）
 - 发布分支：`1.4.2`（基于 `1.4.1`）
-- 平台：Android 本地 SOCKS5 客户端与 `proxy-core` 功耗及性能优化
+- 平台：Android 客户端、Windows 桌面客户端和 `proxy-core` 服务端
 - 版本状态：源码版本已统一为 `1.4.2`，Android `versionCode` 为 `1402`
 
 ## 发布概览
 
-v1.4.2 包含两部分核心改进：
+v1.4.2 首次发布包含两部分核心改进。2026-11-26 的分支更新补充了代理诊断、Windows 控制台和服务端转发修复。
 
 1. **Android 前台服务恢复修复**：解决系统回收并重建 Rama Proxy 进程或前台服务后，本地 SOCKS5 端口没有恢复，导致使用 `127.0.0.1:1080` 的其他代理/VPN 前端或数据采集应用全部断流的问题。
 2. **数据采集场景深度功耗优化与消除“后台频繁刷新”告警**：消除 Android 系统电池管理提示 **“Frequently refreshes in the background. Force stop to save power.”（后台频繁刷新）** 及 ~234 mAh 的后台射频待机耗电，同时通过 **1 条常驻热备隧道 + Android `ConnectivityManager.NetworkCallback` 网络事件驱动秒级重连** 确保代理时刻具备可用网络连接。
@@ -65,6 +65,27 @@ v1.4.2 包含两部分核心改进：
 - 根 workspace、移动端 Rust/Tauri、`package.json`、`package-lock.json` 和 Android 配置统一为 `1.4.2` / `1402`。
 - 更新根 README、`docs/PROJECT-NOTES.md`、`proxy-mobile/README.md` 和 `proxy-core/README.md`。
 
+## 2026-11-26 分支更新
+
+### 服务端转发与连接管理
+
+- TLS 握手失败或超时会清理活跃连接记录，错误日志带 `connection_id`。关闭通知只发给指定连接，其他隧道可以继续转发。
+- TCP 双向转发支持半关闭。一端结束发送后，另一端仍可传完剩余数据。单条隧道双向连续 180 秒无数据时自动回收。
+- 客户端和目标站两侧的 TCP 套接字启用 `TCP_NODELAY` 和 keepalive。单条连接设置失败时记录告警，服务端继续监听。
+- UDP 上行每个数据包只获取一次统计写锁。地址在生成快照时才格式化，快照在锁外排序。
+
+### 拨号诊断
+
+- 客户端隧道日志拆分 TCP、TLS 和认证阶段。SOCKS5 CONNECT 记录是否命中预热池、取隧道耗时和等待目标建连的耗时。
+- 服务端拨号日志记录 `dns_ms`、`tcp_phase_ms` 和 `dial_ms`。`tcp_phase_ms` 包含 DNS 完成后的调度及地址重试。通过 `connection_id` 和客户端的 `server_connection_id` 对照两侧日志。
+- 成功拨号达到 500 ms 时记 INFO，更快的连接记 DEBUG。排查时可将服务端 `log.level` 设为 `info,proxy_core::server_runtime::dial=debug`，查看全部目标拨号记录。
+- `proxy-core` 和移动端日志使用紧凑格式。
+
+### Windows 桌面客户端
+
+- 控制台支持滚轮、滚动条、跟随最新日志和复制全部保留日志。清空日志时重置滚动位置。
+- 本地 SOCKS5 和独立 HTTP CONNECT 使用独占端口监听，防止多个实例同时绑定同一端口。
+
 ## 验证
 
 已通过：
@@ -79,6 +100,7 @@ v1.4.2 包含两部分核心改进：
 - 升级包必须继续使用现有签名证书；证书不一致会无法覆盖安装。
 - 建议允许应用自启动、后台运行，并关闭针对本应用的电池优化限制。
 - 如需在日志中查看逐连接的 SOCKS5 握手与转发完成记录，可将 `RAMA_PROXY_LOG` 或配置文件中的 `log.level` 设为 `debug`。
+- 已有 GUI 可以连接新版服务端。单独升级服务端时只需更新服务端 `proxy-core`。如需新的 Windows 控制台和独占端口行为，可从当前分支重新构建 Windows 客户端。
 
 ## 已知限制
 
