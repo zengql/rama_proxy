@@ -13,7 +13,7 @@ use rama::{
     tcp::client::tcp_connect,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
@@ -42,6 +42,7 @@ mod upstream;
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 const TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const TLS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SLOW_TARGET_DIAL_MS: u64 = 500;
 const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const UDP_SELECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -204,7 +205,7 @@ async fn handle_connection(
                     client = %peer,
                     "tls handshake completed"
                 );
-                handle_connection_io(
+                let io_result = handle_connection_io(
                     &mut stream,
                     peer,
                     config,
@@ -213,7 +214,9 @@ async fn handle_connection(
                     &close,
                     handshake_permit,
                 )
-                .await
+                .await;
+                let _ = tokio::time::timeout(TLS_SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                io_result
             }
             .await
         }

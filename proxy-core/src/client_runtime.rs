@@ -29,18 +29,18 @@ use crate::{
 };
 
 const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a warm (pooled) lease may take to hand out before the request falls
-/// back to a fresh dial.
-const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the server may take to answer a CONNECT on a warm tunnel. A healthy
-/// warm tunnel answers after one round trip plus the server's target dial.
-const WARM_OPEN_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long the server may take to answer a CONNECT on a warm tunnel. Stays
+/// above the server's own outbound dial budget (`OUTBOUND_CONNECT_TIMEOUT`, 5s)
+/// so a slow but healthy target does not trigger a false timeout.
+const WARM_OPEN_TIMEOUT: Duration = Duration::from_secs(6);
 /// Same, for a freshly dialed tunnel. This must stay above the server's own
 /// outbound dial budget (`OUTBOUND_CONNECT_TIMEOUT`, 5s by default), otherwise a
 /// slow but working target is reported as a failure.
 const FRESH_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 /// Timeout for the tunnel-level OPEN response on paths that are not retried.
 const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for sending TLS close_notify / TCP FIN when tearing down a tunnel.
+const TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// A warm attempt followed by one fresh dial. The dominant failure mode on a
 /// lossy path is a silently dead pooled tunnel, and a fresh dial recovers it.
 const CONNECT_ATTEMPTS: usize = 2;
@@ -395,7 +395,10 @@ async fn handle_client(
     debug!(client = %peer, command = ?request.command, destination = %request.destination, "received socks5 request");
 
     match request.command {
-        Command::Connect => serve_connect(stream, peer, request.destination, pool).await,
+        Command::Connect => {
+            let _ = serve_connect(stream, peer, request.destination, pool).await;
+            Ok(())
+        }
         Command::UdpAssociate => {
             if !config.udp.enabled {
                 server::Reply::error_reply(ReplyKind::CommandNotSupported)
@@ -539,9 +542,14 @@ async fn serve_connect(
     }
     info!(target = %destination, tunnel_id, pool = source, acquire_ms, open_ms, target_dial_ms, server_connection_id, total_ms, "SOCKS5 CONNECT ready");
 
-    server::Reply::new(HostWithPort::default_ipv4(0))
+    if let Err(err) = server::Reply::new(HostWithPort::default_ipv4(0))
         .write_to(&mut stream)
-        .await?;
+        .await
+    {
+        warn!(client = %peer, destination = %destination, tunnel_id, error = %err, "failed to write SOCKS5 CONNECT reply");
+        let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+        return Err(AppError::Io(err));
+    }
 
     let result = tokio::select! {
         copied = copy_bidirectional(&mut stream, &mut tunnel) => copied,
@@ -549,10 +557,11 @@ async fn serve_connect(
             debug!(
                 client = %peer,
                 destination = %destination,
+                tunnel_id,
                 idle_timeout_secs = TCP_RELAY_IDLE_TIMEOUT.as_secs(),
                 "closing idle tcp socks5 session"
             );
-            let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
             Ok((0, 0))
         }
     };
@@ -561,6 +570,7 @@ async fn serve_connect(
             debug!(
                 client = %peer,
                 destination = %destination,
+                tunnel_id,
                 up_bytes,
                 down_bytes,
                 "tcp socks5 session finished"
@@ -568,7 +578,8 @@ async fn serve_connect(
             Ok(())
         }
         Err(err) => {
-            warn!(client = %peer, destination = %destination, error = %err, "tcp relay failed after connect");
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+            warn!(client = %peer, destination = %destination, tunnel_id, error = %err, "tcp relay failed after connect");
             Err(AppError::Io(err))
         }
     }
@@ -602,14 +613,9 @@ async fn open_connect_once(
     destination: &HostWithPort,
     fresh: bool,
 ) -> Result<(TunnelLease, String, u64, u64), ConnectFailure> {
-    // With a warm tunnel available the hand-out must be quick; an empty pool has
-    // to dial first, so it needs the full cold-connect budget instead of being
-    // killed and redialed by the retry.
-    let acquire_timeout = if fresh || pool.idle_len() == 0 {
-        pool.acquire_budget()
-    } else {
-        TUNNEL_ACQUIRE_TIMEOUT
-    };
+    // Allow enough time for stale-tunnel probing plus one cold dial so a pool
+    // holding expired idle tunnels is not cut off before falling back to cold.
+    let acquire_timeout = pool.acquire_budget();
     let acquire_started = Instant::now();
     let mut tunnel = tokio::time::timeout(acquire_timeout, async {
         if fresh {
@@ -629,11 +635,12 @@ async fn open_connect_once(
     let acquire_ms = acquire_started.elapsed().as_millis() as u64;
 
     let open_started = Instant::now();
-    write_open_connect(&mut tunnel, destination)
-        .await
-        .map_err(transient)?;
+    if let Err(err) = write_open_connect(&mut tunnel, destination).await {
+        let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+        return Err(transient(err));
+    }
 
-    let open_timeout = if fresh {
+    let open_timeout = if fresh || !tunnel.from_pool() {
         FRESH_OPEN_TIMEOUT
     } else {
         WARM_OPEN_TIMEOUT
@@ -650,15 +657,25 @@ async fn open_connect_once(
                 open_started.elapsed().as_millis() as u64,
             ))
         }
-        Ok(Err(err)) => Err(ConnectFailure {
-            err,
-            retryable: false,
-            rejected: true,
-        }),
-        Err(_) => Err(transient(AppError::Boxed(format!(
-            "tunnel CONNECT timed out after {}s (fresh={fresh})",
-            open_timeout.as_secs()
-        )))),
+        Ok(Err(err)) => {
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+            if matches!(err, AppError::Io(_)) {
+                Err(transient(err))
+            } else {
+                Err(ConnectFailure {
+                    err,
+                    retryable: false,
+                    rejected: true,
+                })
+            }
+        }
+        Err(_) => {
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+            Err(transient(AppError::Boxed(format!(
+                "tunnel CONNECT timed out after {}s (fresh={fresh})",
+                open_timeout.as_secs()
+            ))))
+        }
     }
 }
 
@@ -693,7 +710,7 @@ async fn serve_udp_associate(
             let _ = server::Reply::error_reply(ReplyKind::HostUnreachable)
                 .write_to(&mut tcp_stream)
                 .await;
-            return Err(err);
+            return Ok(());
         }
         Err(_) => {
             warn!(
@@ -704,12 +721,17 @@ async fn serve_udp_associate(
             let _ = server::Reply::error_reply(ReplyKind::HostUnreachable)
                 .write_to(&mut tcp_stream)
                 .await;
-            return Err(AppError::Boxed(format!(
-                "acquire udp tunnel timed out for {peer}"
-            )));
+            return Ok(());
         }
     };
-    write_open_udp(&mut tunnel).await?;
+    if let Err(err) = write_open_udp(&mut tunnel).await {
+        warn!(client = %peer, error = %err, "write open udp request failed");
+        let _ = server::Reply::error_reply(ReplyKind::HostUnreachable)
+            .write_to(&mut tcp_stream)
+            .await;
+        let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+        return Ok(());
+    }
     match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, read_response(&mut tunnel)).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
@@ -717,16 +739,16 @@ async fn serve_udp_associate(
             let _ = server::Reply::error_reply(ReplyKind::GeneralServerFailure)
                 .write_to(&mut tcp_stream)
                 .await;
-            return Err(err);
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+            return Ok(());
         }
         Err(_) => {
             warn!(client = %peer, "wait udp tunnel response timed out");
             let _ = server::Reply::error_reply(ReplyKind::HostUnreachable)
                 .write_to(&mut tcp_stream)
                 .await;
-            return Err(AppError::Boxed(format!(
-                "wait udp tunnel response timed out for {peer}"
-            )));
+            let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
+            return Ok(());
         }
     }
     info!(client = %peer, "udp tunnel connected");
@@ -773,6 +795,7 @@ async fn serve_udp_associate(
                     }
                 } else if opcode_is_close(opcode) {
                     info!(client = %peer, "udp tunnel closed by server");
+                    let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
                     return Ok(());
                 } else if opcode_is_ping(opcode) {
                     write_pong(&mut tunnel).await?;
@@ -788,7 +811,7 @@ async fn serve_udp_associate(
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 if last_activity.elapsed() >= idle_timeout {
                     let _ = write_close(&mut tunnel).await;
-                    let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+                    let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
                     info!(client = %peer, "udp associate idle timeout reached");
                     return Ok(());
                 }
@@ -799,7 +822,7 @@ async fn serve_udp_associate(
             read = tokio::io::copy(&mut tcp_stream, &mut drain_sink) => {
                 let _ = read?;
                 let _ = write_close(&mut tunnel).await;
-                let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+                let _ = tokio::time::timeout(TUNNEL_SHUTDOWN_TIMEOUT, tunnel.shutdown()).await;
                 info!(client = %peer, "udp associate tcp control stream closed");
                 return Ok(());
             }
@@ -903,5 +926,206 @@ mod tests {
             .expect("reader must receive a SOCKS5 reply instead of a silent hang");
         assert_eq!(reply[0], 0x05, "reply must use SOCKS version 5");
         assert_ne!(reply[1], 0x00, "reply must report a failure code");
+    }
+
+    #[tokio::test]
+    async fn dead_warm_tunnel_eof_retries_on_fresh_tunnel() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let mock_server = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let server_addr = mock_server.local_addr().expect("addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_task = accepted.clone();
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = mock_server.accept().await else {
+                    break;
+                };
+                let seq = accepted_task.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    if crate::tunnel::server_handshake(&mut stream, "test-secret", false)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(opcode) = crate::tunnel::read_opcode(&mut stream).await else {
+                        return;
+                    };
+                    if !crate::tunnel::opcode_is_connect(opcode) {
+                        return;
+                    }
+                    let Ok(_target) = crate::tunnel::read_connect_target(&mut stream).await else {
+                        return;
+                    };
+                    if seq == 2 {
+                        // Second connection (warmed into pool) drops immediately without sending OP_RESPONSE.
+                        drop(stream);
+                        return;
+                    }
+                    if crate::tunnel::write_response(&mut stream, 0, "ok id=2 dial_ms=1")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let mut buf = [0u8; 4];
+                    if stream.read_exact(&mut buf).await.is_ok() {
+                        let _ = stream.write_all(&buf).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let config = TunnelClientConfig {
+            server_addr: server_addr.to_string(),
+            shared_secret: "test-secret".to_string(),
+            client_id: "test-client".to_string(),
+            pool_size: 1,
+            connect_timeout_secs: 2,
+            heartbeat_interval_secs: 0,
+            heartbeat_timeout_secs: 1,
+        };
+        let pool = TunnelPool::new(&config, None).expect("build pool");
+        let maintainer = pool.spawn_maintainer();
+
+        // First request wakes the dormant pool so the maintainer warms tunnel #2.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let socks_addr = listener.local_addr().expect("addr");
+        let destination: HostWithPort = "127.0.0.1:9".parse().expect("destination");
+        {
+            let mut client1 = TcpStream::connect(socks_addr).await.expect("connect 1");
+            let (server_side1, peer1) = listener.accept().await.expect("accept 1");
+            let pool1 = pool.clone();
+            let dest1 = destination.clone();
+            let task1 =
+                tokio::spawn(async move { serve_connect(server_side1, peer1, dest1, &pool1).await });
+            let mut reply1 = [0u8; 10];
+            client1.read_exact(&mut reply1).await.expect("reply 1");
+            assert_eq!(reply1[1], 0x00);
+            client1.write_all(b"wake").await.expect("write wake");
+            let mut echo1 = [0u8; 4];
+            client1.read_exact(&mut echo1).await.expect("echo 1");
+            let _ = client1.shutdown().await;
+            task1.await.expect("join 1").expect("wake request succeeds");
+        }
+
+        let wait_deadline = Instant::now() + Duration::from_secs(3);
+        while pool.idle_len() == 0 && Instant::now() < wait_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pool.idle_len(), 1, "pool must warm 1 idle tunnel");
+
+        let mut client = TcpStream::connect(socks_addr).await.expect("connect");
+        let (server_side, peer) = listener.accept().await.expect("accept");
+
+        let connect_task = tokio::spawn(async move {
+            serve_connect(server_side, peer, destination, &pool).await
+        });
+
+        let mut reply = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("reply must arrive")
+            .expect("read reply");
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00, "retry on fresh tunnel must succeed");
+
+        client.write_all(b"ping").await.expect("write ping");
+        let mut echo = [0u8; 4];
+        client.read_exact(&mut echo).await.expect("read echo");
+        assert_eq!(&echo, b"ping");
+        let _ = client.shutdown().await;
+
+        connect_task
+            .await
+            .expect("join")
+            .expect("serve_connect succeeds after retry");
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 3,
+            "must have dialed a fresh tunnel after warm EOF"
+        );
+        maintainer.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn server_rejection_does_not_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let mock_server = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let server_addr = mock_server.local_addr().expect("addr");
+        let connect_requests = Arc::new(AtomicUsize::new(0));
+        let connect_requests_task = connect_requests.clone();
+
+        let server_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = mock_server.accept().await {
+                let reqs = connect_requests_task.clone();
+                tokio::spawn(async move {
+                    if crate::tunnel::server_handshake(&mut stream, "test-secret", false)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(opcode) = crate::tunnel::read_opcode(&mut stream).await else {
+                        return;
+                    };
+                    if crate::tunnel::opcode_is_connect(opcode) {
+                        let _ = crate::tunnel::read_connect_target(&mut stream).await;
+                        reqs.fetch_add(1, Ordering::SeqCst);
+                        let (status, msg) =
+                            crate::tunnel::status_connect_failed("connection refused");
+                        let _ = crate::tunnel::write_response(&mut stream, status, &msg).await;
+                    }
+                });
+            }
+        });
+
+        let config = TunnelClientConfig {
+            server_addr: server_addr.to_string(),
+            shared_secret: "test-secret".to_string(),
+            client_id: "test-client".to_string(),
+            pool_size: 1,
+            connect_timeout_secs: 2,
+            heartbeat_interval_secs: 0,
+            heartbeat_timeout_secs: 1,
+        };
+        let pool = TunnelPool::new(&config, None).expect("build pool");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let socks_addr = listener.local_addr().expect("addr");
+        let mut client = TcpStream::connect(socks_addr).await.expect("connect");
+        let (server_side, peer) = listener.accept().await.expect("accept");
+        let destination: HostWithPort = "127.0.0.1:9".parse().expect("destination");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_connect(server_side, peer, destination, &pool),
+        )
+        .await
+        .expect("serve_connect must not hang");
+        server_task.abort();
+
+        assert!(result.is_err());
+        assert_eq!(
+            connect_requests.load(Ordering::SeqCst),
+            1,
+            "server rejection must not trigger a retry"
+        );
+
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.expect("read reply");
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x01, "rejection must reply GeneralServerFailure");
     }
 }
