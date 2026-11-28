@@ -10,7 +10,7 @@ use rama::{
     utils::str::NonEmptyStr,
 };
 use tokio::{
-    io::copy,
+    io::{AsyncWriteExt, copy_bidirectional},
     net::{TcpStream, UdpSocket},
 };
 use tracing::{debug, info, warn};
@@ -509,13 +509,8 @@ async fn serve_connect(
         .write_to(&mut stream)
         .await?;
 
-    let (mut local_reader, mut local_writer) = tokio::io::split(stream);
-    let (mut tunnel_reader, mut tunnel_writer) = tokio::io::split(tunnel);
     let result = tokio::select! {
-        local_to_tunnel = copy(&mut local_reader, &mut tunnel_writer) =>
-            local_to_tunnel.map(|up_bytes| (up_bytes, 0)),
-        tunnel_to_local = copy(&mut tunnel_reader, &mut local_writer) =>
-            tunnel_to_local.map(|down_bytes| (0, down_bytes)),
+        copied = copy_bidirectional(&mut stream, &mut tunnel) => copied,
         _ = wait_for_tcp_relay_idle(pool) => {
             debug!(
                 client = %peer,
@@ -523,6 +518,7 @@ async fn serve_connect(
                 idle_timeout_secs = TCP_RELAY_IDLE_TIMEOUT.as_secs(),
                 "closing idle tcp socks5 session"
             );
+            let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
             Ok((0, 0))
         }
     };
@@ -642,6 +638,7 @@ async fn serve_udp_associate(
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 if last_activity.elapsed() >= idle_timeout {
                     let _ = write_close(&mut tunnel).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
                     info!(client = %peer, "udp associate idle timeout reached");
                     return Ok(());
                 }
@@ -652,6 +649,7 @@ async fn serve_udp_associate(
             read = tokio::io::copy(&mut tcp_stream, &mut drain_sink) => {
                 let _ = read?;
                 let _ = write_close(&mut tunnel).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
                 info!(client = %peer, "udp associate tcp control stream closed");
                 return Ok(());
             }

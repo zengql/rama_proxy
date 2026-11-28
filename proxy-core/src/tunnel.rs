@@ -245,12 +245,11 @@ impl TunnelPool {
     }
 
     async fn drain_all_idle_tunnels(&self) -> usize {
-        let mut drained = 0usize;
+        let mut drained_tunnels = Vec::new();
         {
             let mut idle_rx = self.idle_rx.lock().await;
             while let Ok(tunnel) = idle_rx.try_recv() {
-                drop(tunnel);
-                drained = drained.saturating_add(1);
+                drained_tunnels.push(tunnel);
             }
         }
         {
@@ -258,7 +257,11 @@ impl TunnelPool {
             refill_state.next_allowed_at = None;
             refill_state.cooldown_logged_for = None;
         }
-        drained
+        let closed = drained_tunnels.len();
+        for mut tunnel in drained_tunnels {
+            let _ = tokio::time::timeout(Duration::from_millis(500), tunnel.stream.shutdown()).await;
+        }
+        closed
     }
 
     async fn advance_on_demand_phase(&self) {
