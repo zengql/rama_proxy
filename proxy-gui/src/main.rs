@@ -1,12 +1,14 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod tray;
+
 use std::{
     collections::VecDeque,
     fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     time::Duration,
 };
 
@@ -33,18 +35,7 @@ use proxy_core::config::{
     LocalUdpConfig, LogConfig, TunnelClientConfig,
 };
 use serde::{Deserialize, Serialize};
-use tray_item::{IconSource, TrayItem};
-
-#[cfg(windows)]
-use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
-#[cfg(windows)]
-use windows_sys::Win32::{
-    System::Threading::GetCurrentProcessId,
-    UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, SW_RESTORE,
-        ShowWindowAsync,
-    },
-};
+use tray::TrayHandle;
 
 const APP_NAME: &str = "Rama Proxy Client";
 const ACCENT_DARK: u32 = 0x0d7046;
@@ -77,6 +68,10 @@ struct GuiSettings {
     remember_config: bool,
     #[serde(default = "default_console_max_lines")]
     console_max_lines: usize,
+    #[serde(default)]
+    simplified_mode: bool,
+    #[serde(default)]
+    auto_start_client: bool,
 }
 
 impl Default for GuiSettings {
@@ -85,6 +80,8 @@ impl Default for GuiSettings {
             close_action: CloseAction::Ask,
             remember_config: true,
             console_max_lines: default_console_max_lines(),
+            simplified_mode: false,
+            auto_start_client: false,
         }
     }
 }
@@ -326,42 +323,31 @@ impl FormInputs {
     }
 }
 
-enum TrayCommand {
+pub(crate) enum TrayCommand {
     Show,
+    ToggleClient,
     Quit,
 }
 
-struct ClientView {
-    inputs: FormInputs,
+struct AppState {
     config_path: PathBuf,
     settings_path: PathBuf,
     settings: GuiSettings,
+    form: ClientForm,
     console_sender: SyncSender<String>,
     console_lines: VecDeque<String>,
     console_bytes: usize,
-    console_scroll_handle: ScrollHandle,
-    follow_console: bool,
     process: Option<Child>,
     status: String,
     error: Option<String>,
-    http_enabled: bool,
-    udp_enabled: bool,
-    tls_enabled: bool,
-    auth_mode: String,
-    remember_close_action: bool,
-    show_close_confirmation: bool,
-    show_settings: bool,
     exiting: bool,
-    _tray: Option<TrayItem>,
+    tray: Option<TrayHandle>,
+    window_handle: Option<gpui_kit::AnyWindowHandle>,
+    active_view: Option<Entity<ClientView>>,
 }
 
-impl ClientView {
-    fn new(
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-        tray: Option<TrayItem>,
-        console_sender: SyncSender<String>,
-    ) -> Self {
+impl AppState {
+    fn new(tray: Option<TrayHandle>, console_sender: SyncSender<String>) -> Self {
         let config_path = default_client_config_path();
         let settings_path = app_data_dir().join("gui.toml");
         let mut settings: GuiSettings = read_toml(&settings_path).unwrap_or_default();
@@ -377,41 +363,44 @@ impl ClientView {
             ClientForm::default()
         };
         let mut state = Self {
-            inputs: FormInputs::new(&form, window, cx),
             config_path,
             settings_path,
             settings,
+            form,
             console_sender,
             console_lines: VecDeque::new(),
             console_bytes: 0,
-            console_scroll_handle: ScrollHandle::new(),
-            follow_console: false,
             process: None,
             status: "Ready".to_string(),
             error: None,
-            http_enabled: form.http_enabled,
-            udp_enabled: form.udp_enabled,
-            tls_enabled: form.tls_enabled,
-            auth_mode: form.auth_mode,
-            remember_close_action: false,
-            show_close_confirmation: false,
-            show_settings: false,
             exiting: false,
-            _tray: tray,
+            tray,
+            window_handle: None,
+            active_view: None,
         };
         state.persist_settings();
+        state.sync_tray_state();
         state
     }
 
-    fn save_config(&mut self, cx: &App) -> bool {
-        let result = self
-            .inputs
-            .form(self, cx)
+    fn tray_available(&self) -> bool {
+        self.tray.as_ref().is_some_and(TrayHandle::is_available)
+    }
+
+    fn sync_tray_state(&self) {
+        if let Some(tray) = &self.tray {
+            tray.set_client_running(self.process.is_some());
+        }
+    }
+
+    fn save_form(&mut self, form: ClientForm) -> bool {
+        let result = form
             .to_config()
             .and_then(|config| toml::to_string_pretty(&config).map_err(|error| error.to_string()))
             .and_then(|content| write_file(&self.config_path, content));
         match result {
             Ok(()) => {
+                self.form = form;
                 self.error = None;
                 self.status = format!("Saved {}", self.config_path.display());
                 true
@@ -423,14 +412,13 @@ impl ClientView {
         }
     }
 
-    fn start_client(&mut self, cx: &App) {
-        if !self.save_config(cx) {
-            self.show_settings = true;
-            return;
+    fn start_client_with_form(&mut self, form: ClientForm) -> bool {
+        if !self.save_form(form) {
+            return false;
         }
         if self.process.is_some() {
             self.status = "Client is already running".to_string();
-            return;
+            return true;
         }
         let mut command = Command::new(proxy_executable());
         command
@@ -453,13 +441,21 @@ impl ClientView {
                 }
                 self.process = Some(child);
                 self.error = None;
+                self.sync_tray_state();
+                true
             }
             Err(error) => {
                 let message = format!("Unable to start proxy-core: {error}");
                 self.append_console(format!("[gui] {message}"));
                 self.error = Some(message);
+                false
             }
         }
+    }
+
+    fn start_client_from_saved(&mut self) -> bool {
+        let form = self.form.clone();
+        self.start_client_with_form(form)
     }
 
     fn stop_client(&mut self) {
@@ -468,6 +464,7 @@ impl ClientView {
             let _ = child.wait();
             self.status = "Client stopped".to_string();
             self.append_console("[gui] Client stopped".to_string());
+            self.sync_tray_state();
         }
     }
 
@@ -480,6 +477,7 @@ impl ClientView {
             self.process = None;
             self.status = format!("Client exited ({status})");
             self.append_console(format!("[gui] {}", self.status));
+            self.sync_tray_state();
             return true;
         }
         false
@@ -492,9 +490,6 @@ impl ClientView {
             self.settings.console_max_lines,
             line,
         );
-        if self.follow_console {
-            self.console_scroll_handle.scroll_to_bottom();
-        }
     }
 
     fn trim_console(&mut self) {
@@ -508,12 +503,85 @@ impl ClientView {
         }
     }
 
+    fn clear_console(&mut self) {
+        self.console_lines.clear();
+        self.console_bytes = 0;
+    }
+
     fn persist_settings(&mut self) {
         let result = toml::to_string_pretty(&self.settings)
             .map_err(|error| error.to_string())
             .and_then(|content| write_file(&self.settings_path, content));
         if let Err(error) = result {
             self.error = Some(format!("Unable to save GUI settings: {error}"));
+        }
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.stop_client();
+    }
+}
+
+struct ClientView {
+    app: Entity<AppState>,
+    inputs: FormInputs,
+    console_scroll_handle: ScrollHandle,
+    follow_console: bool,
+    http_enabled: bool,
+    udp_enabled: bool,
+    tls_enabled: bool,
+    auth_mode: String,
+    remember_close_action: bool,
+    show_close_confirmation: bool,
+    show_settings: bool,
+}
+
+impl ClientView {
+    fn new(
+        app: Entity<AppState>,
+        show_settings: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let form = app.read(cx).form.clone();
+        Self {
+            app,
+            inputs: FormInputs::new(&form, window, cx),
+            console_scroll_handle: ScrollHandle::new(),
+            follow_console: false,
+            http_enabled: form.http_enabled,
+            udp_enabled: form.udp_enabled,
+            tls_enabled: form.tls_enabled,
+            auth_mode: form.auth_mode,
+            remember_close_action: false,
+            show_close_confirmation: false,
+            show_settings,
+        }
+    }
+
+    fn save_config(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        let form = self.inputs.form(self, cx);
+        self.app.update(cx, |app, _| app.save_form(form))
+    }
+
+    fn start_client(&mut self, cx: &mut Context<'_, Self>) {
+        let form = self.inputs.form(self, cx);
+        let started = self
+            .app
+            .update(cx, |app, _| app.start_client_with_form(form));
+        if !started {
+            self.show_settings = true;
+        } else if self.follow_console {
+            self.console_scroll_handle.scroll_to_bottom();
+        }
+    }
+
+    fn stop_client(&mut self, cx: &mut Context<'_, Self>) {
+        self.app.update(cx, |app, _| app.stop_client());
+        if self.follow_console {
+            self.console_scroll_handle.scroll_to_bottom();
         }
     }
 
@@ -813,6 +881,17 @@ impl ClientView {
                         });
                     }),
             );
+        let app = self.app.read(cx);
+        let running = app.process.is_some();
+        let console_len = app.console_lines.len();
+        let console_max_lines = app.settings.console_max_lines;
+        let console_empty = app.console_lines.is_empty();
+        let console_lines = app
+            .console_lines
+            .iter()
+            .map(|line| div().child(SharedString::from(line.clone())))
+            .collect::<Vec<_>>();
+        let error = app.error.clone();
         let controls = h_flex()
             .w_full()
             .justify_between()
@@ -824,15 +903,13 @@ impl ClientView {
                     .min_w_0()
                     .gap_1()
                     .child(div().text_lg().font_semibold().child("Client service"))
-                    .child(div().text_sm().text_color(rgb(0x63706a)).child(
-                        if self.process.is_some() {
-                            "Traffic forwarding is enabled"
-                        } else {
-                            "Traffic forwarding is disabled"
-                        },
-                    )),
+                    .child(div().text_sm().text_color(rgb(0x63706a)).child(if running {
+                        "Traffic forwarding is enabled"
+                    } else {
+                        "Traffic forwarding is disabled"
+                    })),
             )
-            .child(if self.process.is_some() {
+            .child(if running {
                 Button::new("disable-client")
                     .flex_none()
                     .danger()
@@ -840,7 +917,7 @@ impl ClientView {
                     .label("Disable")
                     .on_click(move |_, _, cx| {
                         run_view.update(cx, |state, cx| {
-                            state.stop_client();
+                            state.stop_client(cx);
                             cx.notify();
                         });
                     })
@@ -857,127 +934,124 @@ impl ClientView {
                         });
                     })
             });
-        let console =
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .items_center()
-                        .gap_3()
-                        .flex_wrap()
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w(px(112.))
-                                .items_center()
-                                .gap_2()
-                                .child(div().text_lg().font_semibold().child("Console"))
-                                .child(div().text_sm().text_color(rgb(0x63706a)).child(format!(
-                                    "{} / {} lines",
-                                    self.console_lines.len(),
-                                    self.settings.console_max_lines
-                                ))),
-                        )
-                        .child(
-                            Button::new("follow-console")
-                                .flex_none()
-                                .icon(IconName::ChevronDown)
-                                .label("Follow latest")
-                                .tooltip("Toggle automatic scrolling to the newest console output")
-                                .selected(self.follow_console)
-                                .on_click(move |_, _, cx| {
-                                    follow_view.update(cx, |state, cx| {
-                                        state.follow_console = !state.follow_console;
-                                        if state.follow_console {
-                                            state.console_scroll_handle.scroll_to_bottom();
-                                        }
+        let console = v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .flex_wrap()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(112.))
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_lg().font_semibold().child("Console"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x63706a))
+                                    .child(format!("{console_len} / {console_max_lines} lines",)),
+                            ),
+                    )
+                    .child(
+                        Button::new("follow-console")
+                            .flex_none()
+                            .icon(IconName::ChevronDown)
+                            .label("Follow latest")
+                            .tooltip("Toggle automatic scrolling to the newest console output")
+                            .selected(self.follow_console)
+                            .on_click(move |_, _, cx| {
+                                follow_view.update(cx, |state, cx| {
+                                    state.follow_console = !state.follow_console;
+                                    if state.follow_console {
+                                        state.console_scroll_handle.scroll_to_bottom();
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("copy-console")
+                            .flex_none()
+                            .label("Copy logs")
+                            .tooltip("Copy all retained log lines")
+                            .disabled(console_empty)
+                            .on_click(move |_, _, cx| {
+                                let text = copy_view
+                                    .read(cx)
+                                    .app
+                                    .read(cx)
+                                    .console_lines
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }),
+                    )
+                    .child(
+                        Button::new("clear-console")
+                            .flex_none()
+                            .icon(IconName::Delete)
+                            .label("Clear")
+                            .tooltip("Clear console")
+                            .on_click(move |_, _, cx| {
+                                clear_view.update(cx, |state, cx| {
+                                    state.app.update(cx, |app, _| app.clear_console());
+                                    state.console_scroll_handle = ScrollHandle::new();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(0x243a32))
+                    .bg(rgb(0x10221c))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("console-scroll")
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .flex_col()
+                            .track_scroll(&self.console_scroll_handle)
+                            .overflow_y_scroll()
+                            .vertical_scrollbar(&self.console_scroll_handle)
+                            .font_family("Consolas")
+                            .text_sm()
+                            .text_color(rgb(0xc8ded4))
+                            .on_scroll_wheel(move |_, _, cx| {
+                                manual_scroll_view.update(cx, |state, cx| {
+                                    if state.follow_console {
+                                        state.follow_console = false;
                                         cx.notify();
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("copy-console")
-                                .flex_none()
-                                .label("Copy logs")
-                                .tooltip("Copy all retained log lines")
-                                .disabled(self.console_lines.is_empty())
-                                .on_click(move |_, _, cx| {
-                                    let text = copy_view
-                                        .read(cx)
-                                        .console_lines
-                                        .iter()
-                                        .map(String::as_str)
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                }),
-                        )
-                        .child(
-                            Button::new("clear-console")
-                                .flex_none()
-                                .icon(IconName::Delete)
-                                .label("Clear")
-                                .tooltip("Clear console")
-                                .on_click(move |_, _, cx| {
-                                    clear_view.update(cx, |state, cx| {
-                                        state.console_lines.clear();
-                                        state.console_bytes = 0;
-                                        state.console_scroll_handle = ScrollHandle::new();
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(rgb(0x243a32))
-                        .bg(rgb(0x10221c))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("console-scroll")
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .flex_col()
-                                .track_scroll(&self.console_scroll_handle)
-                                .overflow_y_scroll()
-                                .vertical_scrollbar(&self.console_scroll_handle)
-                                .font_family("Consolas")
-                                .text_sm()
-                                .text_color(rgb(0xc8ded4))
-                                .on_scroll_wheel(move |_, _, cx| {
-                                    manual_scroll_view.update(cx, |state, cx| {
-                                        if state.follow_console {
-                                            state.follow_console = false;
-                                            cx.notify();
-                                        }
-                                    });
-                                })
-                                .child(
-                                    v_flex()
-                                        .flex_none()
-                                        .w_full()
-                                        .px_4()
-                                        .py_3()
-                                        .when(self.console_lines.is_empty(), |view| {
-                                            view.child("No console output.")
-                                        })
-                                        .children(self.console_lines.iter().map(|line| {
-                                            div().child(SharedString::from(line.clone()))
-                                        })),
-                                ),
-                        ),
-                );
+                                    }
+                                });
+                            })
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .w_full()
+                                    .px_4()
+                                    .py_3()
+                                    .when(console_empty, |view| view.child("No console output."))
+                                    .children(console_lines),
+                            ),
+                    ),
+            );
         v_flex()
             .absolute()
             .top(px(24.))
@@ -987,7 +1061,7 @@ impl ClientView {
             .gap_5()
             .child(header)
             .child(controls)
-            .when_some(self.error.clone(), |content, error| {
+            .when_some(error, |content, error| {
                 content.child(
                     div()
                         .w_full()
@@ -1090,12 +1164,18 @@ impl ClientView {
         let back_view = cx.entity();
         let save_view = back_view.clone();
         let remember_view = back_view.clone();
+        let simplified_view = back_view.clone();
+        let auto_start_view = back_view.clone();
         let ask_view = back_view.clone();
         let exit_view = back_view.clone();
         let tray_view = back_view.clone();
         let lines_500_view = back_view.clone();
         let lines_1000_view = back_view.clone();
         let lines_5000_view = back_view.clone();
+        let app = self.app.read(cx);
+        let config_display = format!("Config: {}", app.config_path.display());
+        let settings = app.settings.clone();
+        let error = app.error.clone();
         let header = h_flex()
             .w_full()
             .justify_between()
@@ -1130,7 +1210,7 @@ impl ClientView {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x63706a))
-                                    .child(format!("Config: {}", self.config_path.display())),
+                                    .child(config_display),
                             ),
                     ),
             )
@@ -1144,8 +1224,11 @@ impl ClientView {
                     .on_click(move |_, _, cx| {
                         save_view.update(cx, |state, cx| {
                             if state.save_config(cx) {
-                                state.persist_settings();
-                                if state.error.is_none() {
+                                let has_error = state.app.update(cx, |app, _| {
+                                    app.persist_settings();
+                                    app.error.is_some()
+                                });
+                                if !has_error {
                                     state.show_settings = false;
                                 }
                             }
@@ -1175,11 +1258,41 @@ impl ClientView {
                     .child(
                         Checkbox::new("remember-configuration")
                             .label("Remember configuration locally")
-                            .checked(self.settings.remember_config)
+                            .checked(settings.remember_config)
                             .on_click(move |checked, _, cx| {
                                 remember_view.update(cx, |state, cx| {
-                                    state.settings.remember_config = *checked;
-                                    state.persist_settings();
+                                    state.app.update(cx, |app, _| {
+                                        app.settings.remember_config = *checked;
+                                        app.persist_settings();
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Checkbox::new("simplified-mode")
+                            .label("Simplified mode (start windowless in tray)")
+                            .checked(settings.simplified_mode)
+                            .on_click(move |checked, _, cx| {
+                                simplified_view.update(cx, |state, cx| {
+                                    state.app.update(cx, |app, _| {
+                                        app.settings.simplified_mode = *checked;
+                                        app.persist_settings();
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Checkbox::new("auto-start-client")
+                            .label("Auto-start client on launch")
+                            .checked(settings.auto_start_client)
+                            .on_click(move |checked, _, cx| {
+                                auto_start_view.update(cx, |state, cx| {
+                                    state.app.update(cx, |app, _| {
+                                        app.settings.auto_start_client = *checked;
+                                        app.persist_settings();
+                                    });
                                     cx.notify();
                                 });
                             }),
@@ -1194,13 +1307,14 @@ impl ClientView {
                                     .child(
                                         Button::new("close-behavior-ask")
                                             .label("Ask")
-                                            .selected(
-                                                self.settings.close_action == CloseAction::Ask,
-                                            )
+                                            .selected(settings.close_action == CloseAction::Ask)
                                             .on_click(move |_, _, cx| {
                                                 ask_view.update(cx, |state, cx| {
-                                                    state.settings.close_action = CloseAction::Ask;
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.close_action =
+                                                            CloseAction::Ask;
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1208,13 +1322,14 @@ impl ClientView {
                                     .child(
                                         Button::new("close-behavior-exit")
                                             .label("Exit")
-                                            .selected(
-                                                self.settings.close_action == CloseAction::Exit,
-                                            )
+                                            .selected(settings.close_action == CloseAction::Exit)
                                             .on_click(move |_, _, cx| {
                                                 exit_view.update(cx, |state, cx| {
-                                                    state.settings.close_action = CloseAction::Exit;
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.close_action =
+                                                            CloseAction::Exit;
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1223,14 +1338,16 @@ impl ClientView {
                                         Button::new("close-behavior-tray")
                                             .label("Close to tray")
                                             .selected(
-                                                self.settings.close_action
+                                                settings.close_action
                                                     == CloseAction::MinimizeToTray,
                                             )
                                             .on_click(move |_, _, cx| {
                                                 tray_view.update(cx, |state, cx| {
-                                                    state.settings.close_action =
-                                                        CloseAction::MinimizeToTray;
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.close_action =
+                                                            CloseAction::MinimizeToTray;
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1247,12 +1364,14 @@ impl ClientView {
                                     .child(
                                         Button::new("console-lines-500")
                                             .label("500 lines")
-                                            .selected(self.settings.console_max_lines == 500)
+                                            .selected(settings.console_max_lines == 500)
                                             .on_click(move |_, _, cx| {
                                                 lines_500_view.update(cx, |state, cx| {
-                                                    state.settings.console_max_lines = 500;
-                                                    state.trim_console();
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.console_max_lines = 500;
+                                                        app.trim_console();
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1260,12 +1379,14 @@ impl ClientView {
                                     .child(
                                         Button::new("console-lines-1000")
                                             .label("1,000 lines")
-                                            .selected(self.settings.console_max_lines == 1000)
+                                            .selected(settings.console_max_lines == 1000)
                                             .on_click(move |_, _, cx| {
                                                 lines_1000_view.update(cx, |state, cx| {
-                                                    state.settings.console_max_lines = 1000;
-                                                    state.trim_console();
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.console_max_lines = 1000;
+                                                        app.trim_console();
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1273,12 +1394,14 @@ impl ClientView {
                                     .child(
                                         Button::new("console-lines-5000")
                                             .label("5,000 lines")
-                                            .selected(self.settings.console_max_lines == 5000)
+                                            .selected(settings.console_max_lines == 5000)
                                             .on_click(move |_, _, cx| {
                                                 lines_5000_view.update(cx, |state, cx| {
-                                                    state.settings.console_max_lines = 5000;
-                                                    state.trim_console();
-                                                    state.persist_settings();
+                                                    state.app.update(cx, |app, _| {
+                                                        app.settings.console_max_lines = 5000;
+                                                        app.trim_console();
+                                                        app.persist_settings();
+                                                    });
                                                     cx.notify();
                                                 });
                                             }),
@@ -1317,7 +1440,7 @@ impl ClientView {
                     .pr_3()
                     .child(columns),
             )
-            .when_some(self.error.clone(), |content, error| {
+            .when_some(error, |content, error| {
                 content.child(
                     div()
                         .w_full()
@@ -1333,15 +1456,9 @@ impl ClientView {
     }
 }
 
-impl Drop for ClientView {
-    fn drop(&mut self) {
-        self.stop_client();
-    }
-}
-
 impl Render for ClientView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_process_state();
+        self.app.update(cx, |app, _| app.refresh_process_state());
         let viewport = window.viewport_size();
         let wide = viewport.width >= px(1040.);
         div()
@@ -1426,91 +1543,43 @@ where
         .and_then(|content| toml::from_str(&content).ok())
 }
 
-#[cfg(windows)]
-fn set_window_visible(window: &mut Window, cx: &App, visible: bool) {
-    let Ok(raw_handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::Win32(win32_handle) = raw_handle.as_raw() else {
-        return;
-    };
-    let command = if visible { SW_RESTORE } else { SW_HIDE };
-    let _ = unsafe { ShowWindowAsync(win32_handle.hwnd.into(), command) };
-    if visible {
-        cx.activate(true);
-        window.activate_window();
-    }
-}
-
-#[cfg(windows)]
-fn restore_window_if_hidden(window: &mut Window, cx: &App) {
-    let Ok(raw_handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::Win32(win32_handle) = raw_handle.as_raw() else {
-        return;
-    };
-    if unsafe { IsWindowVisible(win32_handle.hwnd.into()) } == 0 {
-        set_window_visible(window, cx, true);
-    }
-}
-
-#[cfg(not(windows))]
-fn set_window_visible(window: &mut Window, cx: &App, visible: bool) {
-    if visible {
-        cx.activate(true);
-        window.activate_window();
-    } else {
-        cx.hide();
-    }
-}
-
-#[cfg(windows)]
-fn tray_available() -> bool {
-    fn wide(value: &str) -> Vec<u16> {
-        value.encode_utf16().chain(Some(0)).collect()
-    }
-
-    let class_name = wide("my_window");
-    let window_name = wide("rust_systray_window");
-    let current_process = unsafe { GetCurrentProcessId() };
-    let mut child_after = 0;
-    loop {
-        let window =
-            unsafe { FindWindowExW(0, child_after, class_name.as_ptr(), window_name.as_ptr()) };
-        if window == 0 {
-            return false;
-        }
-        let mut process_id = 0;
-        unsafe {
-            GetWindowThreadProcessId(window, &mut process_id);
-        }
-        if process_id == current_process {
-            return true;
-        }
-        child_after = window;
-    }
-}
-
-#[cfg(not(windows))]
-fn tray_available() -> bool {
-    true
-}
-
-fn hide_to_tray(view: &Entity<ClientView>, window: &mut Window, cx: &mut App) {
-    if tray_available() {
-        set_window_visible(window, cx, false);
+fn close_window_to_tray(
+    app: &Entity<AppState>,
+    view: &Entity<ClientView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if app.read(cx).tray_available() {
+        app.update(cx, |state, _| {
+            state.window_handle = None;
+            state.active_view = None;
+        });
+        window.remove_window();
         return;
     }
 
-    view.update(cx, |state, cx| {
-        state.show_close_confirmation = false;
+    app.update(cx, |state, _| {
         state.error = Some(format!(
             "{TRAY_ERROR_PREFIX}; the window will stay open while it is restored."
         ));
+    });
+    view.update(cx, |state, cx| {
+        state.show_close_confirmation = false;
         cx.notify();
     });
-    set_window_visible(window, cx, true);
+}
+
+fn exit_application(app: &Entity<AppState>, cx: &mut App) {
+    let window_handle = app.update(cx, |state, _| {
+        state.exiting = true;
+        state.active_view = None;
+        state.stop_client();
+        state.window_handle.take()
+    });
+    if let Some(handle) = window_handle {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+    cx.quit();
 }
 
 fn apply_close_choice(
@@ -1519,25 +1588,116 @@ fn apply_close_choice(
     window: &mut Window,
     cx: &mut App,
 ) {
-    view.update(cx, |state, _| {
+    let (app, remember) = view.update(cx, |state, _| {
         state.show_close_confirmation = false;
-        if state.remember_close_action {
+        (state.app.clone(), state.remember_close_action)
+    });
+    if remember {
+        app.update(cx, |state, _| {
             state.settings.close_action = action;
             state.persist_settings();
-        }
-        if action == CloseAction::Exit {
-            state.exiting = true;
-            state.stop_client();
-        }
-    });
+        });
+    }
     match action {
-        CloseAction::MinimizeToTray => hide_to_tray(view, window, cx),
-        CloseAction::Exit => {
-            window.remove_window();
-            cx.quit();
-        }
+        CloseAction::MinimizeToTray => close_window_to_tray(&app, view, window, cx),
+        CloseAction::Exit => exit_application(&app, cx),
         CloseAction::Ask => {}
     }
+}
+
+fn open_or_focus_window(app: &Entity<AppState>, show_settings: bool, cx: &mut App) {
+    let (existing_handle, existing_view) = {
+        let state = app.read(cx);
+        (state.window_handle, state.active_view.clone())
+    };
+    if let Some(handle) = existing_handle {
+        let activated = handle.update(cx, |_, window, window_cx| {
+            window_cx.activate(true);
+            window.activate_window();
+        });
+        if activated.is_ok() {
+            if show_settings {
+                if let Some(view) = existing_view {
+                    view.update(cx, |state, cx| {
+                        state.show_settings = true;
+                        cx.notify();
+                    });
+                }
+            }
+            return;
+        }
+        app.update(cx, |state, _| {
+            state.window_handle = None;
+            state.active_view = None;
+        });
+    }
+
+    let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
+    let mut created_view = None;
+    let window_handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title(APP_NAME);
+                let view = cx.new(|cx| ClientView::new(app.clone(), show_settings, window, cx));
+                created_view = Some(view.clone());
+                let close_app = app.clone();
+                let close_view = view.clone();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let close_action = close_app.read(cx).settings.close_action;
+                    match close_action {
+                        CloseAction::Exit => {
+                            close_app.update(cx, |state, _| {
+                                state.exiting = true;
+                                state.active_view = None;
+                                state.window_handle = None;
+                                state.stop_client();
+                            });
+                            cx.quit();
+                            true
+                        }
+                        CloseAction::MinimizeToTray => {
+                            if close_app.read(cx).tray_available() {
+                                close_app.update(cx, |state, _| {
+                                    state.window_handle = None;
+                                    state.active_view = None;
+                                });
+                                true
+                            } else {
+                                close_app.update(cx, |state, _| {
+                                    state.error = Some(format!(
+                                        "{TRAY_ERROR_PREFIX}; the window will stay open while it is restored."
+                                    ));
+                                });
+                                close_view.update(cx, |_, cx| cx.notify());
+                                false
+                            }
+                        }
+                        CloseAction::Ask => {
+                            close_view.update(cx, |state, cx| {
+                                if !state.show_close_confirmation {
+                                    state.show_close_confirmation = true;
+                                    cx.notify();
+                                }
+                            });
+                            false
+                        }
+                    }
+                });
+                cx.new(|cx| Root::new(view, window, cx).font_family("Segoe UI"))
+            },
+        )
+        .expect("Failed to open Rama Proxy window");
+    let created_view = created_view.expect("Client view was not initialized");
+    app.update(cx, |state, _| {
+        state.window_handle = Some(window_handle.into());
+        state.active_view = Some(created_view);
+    });
+    cx.activate(true);
+    let _ = window_handle.update(cx, |_, window, _| window.activate_window());
 }
 
 fn write_file(path: &Path, content: String) -> Result<(), String> {
@@ -1579,31 +1739,13 @@ fn proxy_executable() -> PathBuf {
     path
 }
 
-fn create_tray_with_receiver() -> Result<(TrayItem, Receiver<TrayCommand>), String> {
+fn create_tray_with_receiver() -> Result<(TrayHandle, Receiver<TrayCommand>), String> {
     let (sender, receiver) = mpsc::channel();
-    let tray = create_tray(sender).map_err(|error| error.to_string())?;
+    let tray = tray::create_tray(sender)?;
     Ok((tray, receiver))
 }
 
-fn create_tray(sender: Sender<TrayCommand>) -> Result<TrayItem, tray_item::TIError> {
-    // The Windows resource compiler preserves the quoted RC identifier.
-    let mut tray = TrayItem::new(APP_NAME, IconSource::Resource("\"rama-proxy-ladder\""))?;
-    let show = sender.clone();
-    tray.add_menu_item("Open", move || {
-        let _ = show.send(TrayCommand::Show);
-    })?;
-    tray.add_menu_item("Exit", move || {
-        let _ = sender.send(TrayCommand::Quit);
-    })?;
-    Ok(tray)
-}
-
-fn handle_tray_commands(
-    receiver: Receiver<TrayCommand>,
-    view: Entity<ClientView>,
-    window_handle: gpui_kit::AnyWindowHandle,
-    cx: &mut App,
-) {
+fn handle_tray_commands(receiver: Receiver<TrayCommand>, app: Entity<AppState>, cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor()
@@ -1616,18 +1758,41 @@ fn handle_tray_commands(
             };
             let should_continue = cx.update(|cx| match command {
                 TrayCommand::Show => {
-                    let _ = window_handle.update(cx, |_, window, window_cx| {
-                        set_window_visible(window, window_cx, true);
-                    });
+                    open_or_focus_window(&app, false, cx);
+                    true
+                }
+                TrayCommand::ToggleClient => {
+                    let (is_running, active_view) = {
+                        let state = app.read(cx);
+                        (state.process.is_some(), state.active_view.clone())
+                    };
+                    if is_running {
+                        if let Some(view) = active_view {
+                            view.update(cx, |state, cx| {
+                                state.stop_client(cx);
+                                cx.notify();
+                            });
+                        } else {
+                            app.update(cx, |state, _| state.stop_client());
+                        }
+                    } else {
+                        let start_failed = if let Some(view) = active_view {
+                            view.update(cx, |state, cx| {
+                                state.start_client(cx);
+                                cx.notify();
+                            });
+                            app.read(cx).error.is_some()
+                        } else {
+                            !app.update(cx, |state, _| state.start_client_from_saved())
+                        };
+                        if start_failed {
+                            open_or_focus_window(&app, true, cx);
+                        }
+                    }
                     true
                 }
                 TrayCommand::Quit => {
-                    view.update(cx, |state, _| {
-                        state.exiting = true;
-                        state.stop_client();
-                    });
-                    let _ = window_handle.update(cx, |_, window, _| window.remove_window());
-                    cx.quit();
+                    exit_application(&app, cx);
                     false
                 }
             });
@@ -1639,36 +1804,40 @@ fn handle_tray_commands(
     .detach();
 }
 
-fn monitor_tray(view: Entity<ClientView>, window_handle: gpui_kit::AnyWindowHandle, cx: &mut App) {
+fn monitor_tray(app: Entity<AppState>, cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(TRAY_MONITOR_INTERVAL).await;
-            let should_continue = cx.update(|cx| !view.read(cx).exiting);
+            let (should_continue, available) = cx.update(|cx| {
+                let state = app.read(cx);
+                (!state.exiting, state.tray_available())
+            });
             if !should_continue {
                 break;
             }
-            if tray_available() {
+            if available {
                 continue;
             }
 
             match create_tray_with_receiver() {
                 Ok((tray, receiver)) => {
                     cx.update(|cx| {
-                        view.update(cx, |state, cx| {
+                        let active_view = app.update(cx, |state, _| {
                             let had_tray_error = state
                                 .error
                                 .as_deref()
                                 .is_some_and(|error| error.starts_with(TRAY_ERROR_PREFIX));
-                            state._tray = Some(tray);
+                            state.tray = Some(tray);
+                            state.sync_tray_state();
                             if had_tray_error {
                                 state.error = None;
-                                cx.notify();
                             }
+                            state.active_view.clone()
                         });
-                    });
-                    let handler_view = view.clone();
-                    cx.update(|cx| {
-                        handle_tray_commands(receiver, handler_view, window_handle, cx);
+                        if let Some(view) = active_view {
+                            view.update(cx, |_, cx| cx.notify());
+                        }
+                        handle_tray_commands(receiver, app.clone(), cx);
                     });
                 }
                 Err(error) => {
@@ -1676,15 +1845,16 @@ fn monitor_tray(view: Entity<ClientView>, window_handle: gpui_kit::AnyWindowHand
                         "{TRAY_ERROR_PREFIX}: {error}; the window will stay open while retrying."
                     );
                     cx.update(|cx| {
-                        view.update(cx, |state, cx| {
+                        let active_view = app.update(cx, |state, _| {
                             if state.error.as_deref() != Some(message.as_str()) {
                                 state.error = Some(message.clone());
-                                cx.notify();
                             }
+                            state.active_view.clone()
                         });
-                        let _ = window_handle.update(cx, |_, window, window_cx| {
-                            restore_window_if_hidden(window, window_cx);
-                        });
+                        if let Some(view) = active_view {
+                            view.update(cx, |_, cx| cx.notify());
+                        }
+                        open_or_focus_window(&app, false, cx);
                     });
                 }
             }
@@ -1693,7 +1863,7 @@ fn monitor_tray(view: Entity<ClientView>, window_handle: gpui_kit::AnyWindowHand
     .detach();
 }
 
-fn handle_console_output(receiver: Receiver<String>, view: Entity<ClientView>, cx: &mut App) {
+fn handle_console_output(receiver: Receiver<String>, app: Entity<AppState>, cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor()
@@ -1701,16 +1871,24 @@ fn handle_console_output(receiver: Receiver<String>, view: Entity<ClientView>, c
                 .await;
             let lines = receiver.try_iter().collect::<Vec<_>>();
             cx.update(|cx| {
-                view.update(cx, |state, cx| {
+                let (changed, active_view) = app.update(cx, |state, _| {
                     let mut changed = state.refresh_process_state();
                     for line in lines {
                         state.append_console(line);
                         changed = true;
                     }
-                    if changed {
-                        cx.notify();
-                    }
+                    (changed, state.active_view.clone())
                 });
+                if changed {
+                    if let Some(view) = active_view {
+                        view.update(cx, |state, cx| {
+                            if state.follow_console {
+                                state.console_scroll_handle.scroll_to_bottom();
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
             });
         }
     })
@@ -1719,9 +1897,12 @@ fn handle_console_output(receiver: Receiver<String>, view: Entity<ClientView>, c
 
 fn main() {
     gpui_kit::application()
+        .with_quit_mode(gpui_kit::QuitMode::Explicit)
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            let cli_simplified =
+                std::env::args().any(|arg| arg == "--tray" || arg == "--simplified");
             let (console_tx, console_rx) = mpsc::sync_channel(CONSOLE_CHANNEL_CAPACITY);
             let (tray, tray_rx, tray_error) = match create_tray_with_receiver() {
                 Ok((tray, receiver)) => (Some(tray), Some(receiver), None),
@@ -1733,62 +1914,29 @@ fn main() {
                     )),
                 ),
             };
-            let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
-            let mut client_view = None;
-            let window_handle = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                        window.set_window_title(APP_NAME);
-                        let view =
-                            cx.new(|cx| ClientView::new(window, cx, tray, console_tx.clone()));
-                        client_view = Some(view.clone());
-                        let close_view = view.clone();
-                        window.on_window_should_close(cx, move |window, cx| {
-                            match close_view.read(cx).settings.close_action {
-                                CloseAction::Exit => {
-                                    close_view.update(cx, |state, _| {
-                                        state.exiting = true;
-                                        state.stop_client();
-                                    });
-                                    true
-                                }
-                                CloseAction::MinimizeToTray => {
-                                    hide_to_tray(&close_view, window, cx);
-                                    false
-                                }
-                                CloseAction::Ask => {
-                                    close_view.update(cx, |state, cx| {
-                                        if !state.show_close_confirmation {
-                                            state.show_close_confirmation = true;
-                                            cx.notify();
-                                        }
-                                    });
-                                    false
-                                }
-                            }
-                        });
-                        cx.new(|cx| Root::new(view, window, cx).font_family("Segoe UI"))
-                    },
-                )
-                .expect("Failed to open Rama Proxy window");
-            cx.activate(true);
-            let _ = window_handle.update(cx, |_, window, _| window.activate_window());
-            let client_view = client_view.expect("Client view was not initialized");
-            if let Some(error) = tray_error {
-                client_view.update(cx, |state, cx| {
+            let app = cx.new(|_| AppState::new(tray, console_tx));
+            let (simplified_mode, tray_ready, has_error) = app.update(cx, |state, _| {
+                if let Some(error) = tray_error {
                     state.error = Some(error);
-                    cx.notify();
-                });
+                }
+                if state.settings.auto_start_client {
+                    state.start_client_from_saved();
+                }
+                (
+                    state.settings.simplified_mode,
+                    state.tray_available(),
+                    state.error.is_some(),
+                )
+            });
+            let start_windowless = (cli_simplified || simplified_mode) && tray_ready && !has_error;
+            if !start_windowless {
+                open_or_focus_window(&app, false, cx);
             }
             if let Some(receiver) = tray_rx {
-                handle_tray_commands(receiver, client_view.clone(), window_handle.into(), cx);
+                handle_tray_commands(receiver, app.clone(), cx);
             }
-            monitor_tray(client_view.clone(), window_handle.into(), cx);
-            handle_console_output(console_rx, client_view, cx);
+            monitor_tray(app.clone(), cx);
+            handle_console_output(console_rx, app, cx);
         });
 }
 
@@ -1797,8 +1945,8 @@ mod tests {
     use std::{collections::VecDeque, sync::mpsc};
 
     use super::{
-        CONSOLE_MAX_BYTES, CONSOLE_MAX_LINE_BYTES, ClientForm, create_tray,
-        default_client_config_path, push_console_line, spawn_console_reader, tray_available,
+        APP_NAME, CONSOLE_MAX_BYTES, CONSOLE_MAX_LINE_BYTES, ClientForm,
+        default_client_config_path, push_console_line, spawn_console_reader, tray,
     };
 
     fn valid_form() -> ClientForm {
@@ -1891,10 +2039,20 @@ mod tests {
     #[test]
     fn tray_icon_resource_can_be_created() {
         let (sender, _receiver) = mpsc::channel();
-        let tray = create_tray(sender).expect("tray icon resource must be loadable");
-        assert!(tray_available());
+        let tray = tray::create_tray(sender).expect("tray icon resource must be loadable");
+        assert!(tray.is_available());
         drop(tray);
-        assert!(!tray_available());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_creation_failure_returns_error_cleanly() {
+        let (sender, _receiver) = mpsc::channel();
+        let err =
+            tray::TrayHandle::new_with_icon_resource(APP_NAME, "nonexistent-icon-resource", sender)
+                .err()
+                .expect("missing tray icon resource must return an error");
+        assert!(err.contains("LoadImageW"), "{err}");
     }
 
     #[test]

@@ -318,11 +318,9 @@ impl ClientSettings {
         config.client.shared_secret = self.shared_secret.clone();
         config.client.client_id = self.client_id.trim().to_string();
         config.client.pool_size = self.pool_size;
-        // Disable the separate 60-second heartbeat control channel on mobile:
-        // TunnelPool already maintains, probes, and refills the warm data tunnels,
-        // and the 60s server heartbeat push caused 1,440 radio wakeups/day and
-        // triggered Android's "Frequently refreshes in the background" battery warning.
-        config.client.heartbeat_interval_secs = 0;
+        // Core runtime handles on-demand wake-up and two-stage dormancy
+        // (5m reserved pool close + 5m heartbeat grace -> dormant).
+        config.client.heartbeat_interval_secs = 60;
 
         // Mobile clients are intentionally local-only. Do not accept a
         // configurable LAN bind address from the frontend.
@@ -630,7 +628,9 @@ async fn restore_runtime_from_android(data_dir: String) -> Result<String, String
     let config_path = data_dir.join(CONFIG_FILE);
     let mut config = ClientConfigFile::from_path(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
-    config.client.heartbeat_interval_secs = 0;
+    if config.client.heartbeat_interval_secs == 0 {
+        config.client.heartbeat_interval_secs = 60;
+    }
     config.socks5.tcp_keepalive_secs = 300;
 
     info!(

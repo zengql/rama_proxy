@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
 
+use rama::net::address::HostWithPort;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
@@ -17,6 +18,18 @@ pub struct ServerConfigFile {
     pub tls: ServerTlsConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamSocks5Config>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamSocks5Config {
+    pub address: HostWithPort,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +185,7 @@ impl Default for ServerConfigFile {
             auth: TunnelAuthConfig::default(),
             tls: ServerTlsConfig::default(),
             log: LogConfig::default(),
+            upstream: None,
         }
     }
 }
@@ -325,6 +339,29 @@ impl ServerConfigFile {
             return Err(AppError::InvalidConfig(
                 "auth.shared_secret must not be empty".to_string(),
             ));
+        }
+        if let Some(upstream) = &self.upstream {
+            if upstream.address.port == 0 {
+                return Err(AppError::InvalidConfig(
+                    "upstream.address port must be greater than 0".to_string(),
+                ));
+            }
+            if upstream.connect_timeout_secs == Some(0) {
+                return Err(AppError::InvalidConfig(
+                    "upstream.connect_timeout_secs must be greater than 0".to_string(),
+                ));
+            }
+            match (&upstream.username, &upstream.password) {
+                (None, None) => {}
+                (Some(username), Some(password))
+                    if (1..=255).contains(&username.len())
+                        && (1..=255).contains(&password.len()) => {}
+                _ => {
+                    return Err(AppError::InvalidConfig(
+                        "upstream.username and upstream.password must both be omitted or both be 1 to 255 bytes".to_string(),
+                    ));
+                }
+            }
         }
         validate_server_tls_config(&self.tls)?;
         Ok(())
@@ -632,6 +669,14 @@ udp_idle_timeout_secs = 300
 tcp_keepalive_secs = 60
 heartbeat_interval_secs = 60
 heartbeat_timeout_secs = 10
+
+# Optional SOCKS5 upstream for TCP and UDP. Failures are reported without direct fallback.
+# B must support UDP ASSOCIATE to relay UDP. Omit both credentials if B needs no authentication.
+# [upstream]
+# address = "proxy.example.com:1080"
+# username = "user"
+# password = "password"
+# connect_timeout_secs = 10
 
 [auth]
 shared_secret = "change-me"

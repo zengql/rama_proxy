@@ -154,6 +154,22 @@ fn tcp_pool_warms_without_udp_associate() -> Result<(), Box<dyn Error>> {
         SocketAddr::from((Ipv4Addr::LOCALHOST, socks5_port)),
     );
 
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_thread = thread::spawn(move || -> io::Result<()> {
+        for _ in 0..2 {
+            let (mut conn, _) = upstream.accept()?;
+            let mut buf = [0u8; 4];
+            if conn.read(&mut buf)? > 0 {
+                conn.write_all(b"pong")?;
+            }
+        }
+        Ok(())
+    });
+
+    // Wake the client with an initial SOCKS5 CONNECT (UDP is disabled).
+    send_socks5_ping(socks5_port, upstream_addr)?;
+
     let deadline = Instant::now() + IO_TIMEOUT;
     loop {
         server.ensure_running();
@@ -179,25 +195,15 @@ fn tcp_pool_warms_without_udp_associate() -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let upstream_addr = upstream.local_addr()?;
-    let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, socks5_port))?;
-    control.set_read_timeout(Some(IO_TIMEOUT))?;
-    control.write_all(&[0x05, 0x01, 0x00])?;
-    let mut handshake = [0; 2];
-    control.read_exact(&mut handshake)?;
-    assert_eq!(handshake, [0x05, 0x00]);
-    let mut connect = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
-    connect.extend_from_slice(&upstream_addr.port().to_be_bytes());
-    control.write_all(&connect)?;
-    let mut reply = [0; 10];
-    control.read_exact(&mut reply)?;
-    assert_eq!(reply[..2], [0x05, 0x00]);
+    send_socks5_ping(socks5_port, upstream_addr)?;
+    upstream_thread
+        .join()
+        .map_err(|_| io::Error::other("upstream thread panicked"))??;
 
     let client_logs = client.logs();
     let connected = client_logs
         .lines()
-        .find(|line| line.contains("SOCKS5 CONNECT ready"))
+        .rfind(|line| line.contains("SOCKS5 CONNECT ready"))
         .expect("client should log successful CONNECT");
     assert!(
         connected.split_ascii_whitespace().any(|field| {
@@ -223,6 +229,365 @@ fn tcp_pool_warms_without_udp_associate() -> Result<(), Box<dyn Error>> {
                 .split_ascii_whitespace()
                 .any(|field| field.strip_prefix("connection_id=") == Some(id))
     }));
+    Ok(())
+}
+
+#[test]
+fn on_demand_client_lifecycle_wakes_closes_pool_then_heartbeat_and_rewakes()
+-> Result<(), Box<dyn Error>> {
+    const POOL_SIZE: usize = 2;
+    let temp_dir = TestDir::new("rama-proxy-on-demand")?;
+    let server_port = unused_tcp_port(None)?;
+    let socks5_port = unused_tcp_port(Some(server_port))?;
+
+    let server_config_path = temp_dir.path().join("server.toml");
+    let stats_socket_path = temp_dir.path().join("server.stats.sock");
+    write_server_config(&server_config_path, server_port, 1)?;
+
+    let mut server_command = Command::new(env!("CARGO_BIN_EXE_proxy-core"));
+    server_command
+        .arg("server")
+        .arg("--config")
+        .arg(&server_config_path)
+        .arg("--stats-socket")
+        .arg(&stats_socket_path);
+    let mut server = TestProcess::spawn("server", server_command, temp_dir.path())?;
+    wait_for_tcp(
+        &mut server,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, server_port)),
+    );
+
+    let client_config_path = temp_dir.path().join("client.toml");
+    write_client_config(&client_config_path, server_port, socks5_port, POOL_SIZE, false, 1)?;
+
+    let mut client_command = Command::new(env!("CARGO_BIN_EXE_proxy-core"));
+    client_command
+        .arg("client")
+        .arg("--config")
+        .arg(&client_config_path)
+        .env("RAMA_PROXY_POOL_IDLE_TIMEOUT_SECS", "2")
+        .env("RAMA_PROXY_HEARTBEAT_IDLE_GRACE_SECS", "2");
+    let mut client = TestProcess::spawn("client", client_command, temp_dir.path())?;
+    wait_for_tcp(
+        &mut client,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, socks5_port)),
+    );
+
+    // Phase 1: Dormant on startup (no reserved tunnels and no heartbeat connection).
+    thread::sleep(Duration::from_millis(1500));
+    server.ensure_running();
+    client.ensure_running();
+    let initial_client_logs = client.logs();
+    let initial_server_logs = server.logs();
+    assert_eq!(
+        count_occurrences(&initial_client_logs, "idle tunnel added to pool"),
+        0,
+        "dormant client should not create reserved tunnels before a request\n{initial_client_logs}"
+    );
+    assert_eq!(
+        count_occurrences(&initial_server_logs, "heartbeat control channel established"),
+        0,
+        "dormant client should not establish heartbeat before a request\n{initial_server_logs}"
+    );
+
+    // Phase 2: Incoming SOCKS5 request wakes pool + heartbeat and refills reserved tunnels.
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_thread = thread::spawn(move || -> io::Result<()> {
+        for _ in 0..2 {
+            let (mut conn, _) = upstream.accept()?;
+            let mut buf = [0u8; 4];
+            if conn.read(&mut buf)? > 0 {
+                conn.write_all(b"pong")?;
+            }
+        }
+        Ok(())
+    });
+
+    send_socks5_ping(socks5_port, upstream_addr)?;
+
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        let client_logs = client.logs();
+        let server_logs = server.logs();
+        if count_occurrences(&client_logs, "idle tunnel added to pool") >= POOL_SIZE
+            && count_occurrences(&server_logs, "heartbeat control channel established") >= 1
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "on-demand client did not warm pool and heartbeat after first request\nclient:\n{client_logs}\nserver:\n{server_logs}"
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Phase 3: After pool_idle_timeout (2s), reserved pool closes while heartbeat stays alive.
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let pool_closed_time;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        let client_logs = client.logs();
+        if client_logs.contains("idle pool timeout reached; closing reserved tunnels") {
+            pool_closed_time = Instant::now();
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("client did not close reserved pool after idle timeout\n{client_logs}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Verify heartbeat continues during the grace window (and sees 0 reserved tunnels).
+    let snapshots_at_pool_close = count_occurrences(&server.logs(), "heartbeat tunnel snapshot sent");
+    let grace_deadline = pool_closed_time + Duration::from_millis(1500);
+    loop {
+        let server_logs = server.logs();
+        let current_snapshots = count_occurrences(&server_logs, "heartbeat tunnel snapshot sent");
+        if current_snapshots > snapshots_at_pool_close
+            && server_logs
+                .lines()
+                .filter(|line| line.contains("heartbeat tunnel snapshot sent"))
+                .last()
+                .is_some_and(|line| line.contains("tunnel_count=0"))
+        {
+            break;
+        }
+        if Instant::now() >= grace_deadline {
+            panic!(
+                "heartbeat did not remain active during grace period\nclient:\n{}\nserver:\n{}",
+                client.logs(),
+                server_logs
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Phase 4: After heartbeat_idle_grace (another 2s), client enters Dormant and closes heartbeat.
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        let client_logs = client.logs();
+        if client_logs.contains("heartbeat idle grace elapsed; entering dormant state") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("client did not enter dormant state after grace timeout\n{client_logs}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Confirm heartbeat stops sending snapshots once dormant.
+    thread::sleep(Duration::from_millis(400));
+    let dormant_snapshots = count_occurrences(&server.logs(), "heartbeat tunnel snapshot sent");
+    thread::sleep(Duration::from_millis(1400));
+    assert_eq!(
+        count_occurrences(&server.logs(), "heartbeat tunnel snapshot sent"),
+        dormant_snapshots,
+        "dormant client should stop heartbeat activity\n{}",
+        server.logs()
+    );
+
+    // Phase 5: A new SOCKS5 request re-wakes the client cleanly.
+    send_socks5_ping(socks5_port, upstream_addr)?;
+
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        let client_logs = client.logs();
+        let server_logs = server.logs();
+        if count_occurrences(&client_logs, "on-demand request received; waking tunnel pool") >= 2
+            && count_occurrences(&server_logs, "heartbeat control channel established") >= 2
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "client did not re-wake pool and heartbeat on second request\nclient:\n{client_logs}\nserver:\n{server_logs}"
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    upstream_thread
+        .join()
+        .map_err(|_| io::Error::other("upstream echo thread panicked"))??;
+    Ok(())
+}
+
+#[test]
+fn on_demand_requests_reset_pool_and_heartbeat_idle_timers() -> Result<(), Box<dyn Error>> {
+    const POOL_SIZE: usize = 2;
+    let temp_dir = TestDir::new("rama-proxy-timer-reset")?;
+    let server_port = unused_tcp_port(None)?;
+    let socks5_port = unused_tcp_port(Some(server_port))?;
+
+    let server_config_path = temp_dir.path().join("server.toml");
+    let stats_socket_path = temp_dir.path().join("server.stats.sock");
+    write_server_config(&server_config_path, server_port, 1)?;
+
+    let mut server_command = Command::new(env!("CARGO_BIN_EXE_proxy-core"));
+    server_command
+        .arg("server")
+        .arg("--config")
+        .arg(&server_config_path)
+        .arg("--stats-socket")
+        .arg(&stats_socket_path);
+    let mut server = TestProcess::spawn("server", server_command, temp_dir.path())?;
+    wait_for_tcp(
+        &mut server,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, server_port)),
+    );
+
+    let client_config_path = temp_dir.path().join("client.toml");
+    write_client_config(&client_config_path, server_port, socks5_port, POOL_SIZE, false, 1)?;
+
+    let mut client_command = Command::new(env!("CARGO_BIN_EXE_proxy-core"));
+    client_command
+        .arg("client")
+        .arg("--config")
+        .arg(&client_config_path)
+        .env("RAMA_PROXY_POOL_IDLE_TIMEOUT_SECS", "2")
+        .env("RAMA_PROXY_HEARTBEAT_IDLE_GRACE_SECS", "2");
+    let mut client = TestProcess::spawn("client", client_command, temp_dir.path())?;
+    wait_for_tcp(
+        &mut client,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, socks5_port)),
+    );
+
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_thread = thread::spawn(move || -> io::Result<()> {
+        for _ in 0..4 {
+            let (mut conn, _) = upstream.accept()?;
+            let mut buf = [0u8; 4];
+            if conn.read(&mut buf)? > 0 {
+                conn.write_all(b"pong")?;
+            }
+        }
+        Ok(())
+    });
+
+    // 1. Wake up with request 1 and wait for reserved pool to warm.
+    send_socks5_ping(socks5_port, upstream_addr)?;
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        if count_occurrences(&client.logs(), "idle tunnel added to pool") >= POOL_SIZE
+            && count_occurrences(&server.logs(), "heartbeat control channel established") >= 1
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("client did not warm pool\n{}", client.logs());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // 2. Send request 2 after 1.1s and request 3 after another 1.1s (> 2.2s since request 1).
+    // Each request resets the 2s pool idle timer so the reserved pool must stay alive.
+    thread::sleep(Duration::from_millis(1100));
+    send_socks5_ping(socks5_port, upstream_addr)?;
+    thread::sleep(Duration::from_millis(1100));
+    send_socks5_ping(socks5_port, upstream_addr)?;
+
+    let client_logs = client.logs();
+    assert_eq!(
+        count_occurrences(&client_logs, "idle pool timeout reached"),
+        0,
+        "pool idle timer should have been reset by periodic requests\n{client_logs}"
+    );
+    let last_connect = client_logs
+        .lines()
+        .rfind(|line| line.contains("SOCKS5 CONNECT ready"))
+        .expect("request 3 should succeed");
+    assert!(
+        last_connect.contains("pool=\"warm\""),
+        "request 3 should reuse warm tunnel after timer reset: {last_connect}"
+    );
+
+    // 3. Stop sending requests so pool closes and client enters HeartbeatGrace.
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        if count_occurrences(&client.logs(), "idle pool timeout reached") >= 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("client did not enter HeartbeatGrace\n{}", client.logs());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // 4. Inside HeartbeatGrace (after 0.9s < 2s), send request 4 to reset timers back to Active,
+    // then wait 1.5s (past the original grace deadline) and verify it did NOT go dormant.
+    thread::sleep(Duration::from_millis(900));
+    send_socks5_ping(socks5_port, upstream_addr)?;
+    thread::sleep(Duration::from_millis(1500));
+
+    let client_logs = client.logs();
+    let server_logs = server.logs();
+    assert!(
+        client_logs.contains("previous_phase=HeartbeatGrace"),
+        "request 4 should wake from HeartbeatGrace\n{client_logs}"
+    );
+    assert_eq!(
+        count_occurrences(&client_logs, "entering dormant state"),
+        0,
+        "client should not enter dormant state after request 4 reset the timer\n{client_logs}"
+    );
+    assert_eq!(
+        count_occurrences(&server_logs, "heartbeat control channel established"),
+        1,
+        "heartbeat channel should remain continuously established without reconnecting\n{server_logs}"
+    );
+
+    // 5. Stop sending requests and confirm it eventually enters Dormant after reset timers expire.
+    let deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        server.ensure_running();
+        client.ensure_running();
+        if count_occurrences(&client.logs(), "entering dormant state") >= 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("client did not enter dormant state after final idle\n{}", client.logs());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    upstream_thread
+        .join()
+        .map_err(|_| io::Error::other("upstream echo thread panicked"))??;
+    Ok(())
+}
+
+fn send_socks5_ping(socks5_port: u16, upstream_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
+    let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, socks5_port))?;
+    control.set_read_timeout(Some(IO_TIMEOUT))?;
+    control.set_write_timeout(Some(IO_TIMEOUT))?;
+    control.write_all(&[0x05, 0x01, 0x00])?;
+    let mut handshake = [0u8; 2];
+    control.read_exact(&mut handshake)?;
+    assert_eq!(handshake, [0x05, 0x00]);
+    let mut connect = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    connect.extend_from_slice(&upstream_addr.port().to_be_bytes());
+    control.write_all(&connect)?;
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply)?;
+    assert_eq!(reply[..2], [0x05, 0x00]);
+    control.write_all(b"ping")?;
+    let mut resp = [0u8; 4];
+    control.read_exact(&mut resp)?;
+    assert_eq!(&resp, b"pong");
     Ok(())
 }
 

@@ -16,6 +16,7 @@ Rama Proxy 是一个基于 Rust 的代理项目，包含桌面端、核心 CLI/�
 
 - [项目注意事项与运维手册](docs/PROJECT-NOTES.md)：构建、签名、UDP、TCP 连接池、日志、TLS、Android 睡眠和诊断。
 - [Android 客户端详细说明](proxy-mobile/README.md)：Android Studio 导入、ABI、APK 产物和端到端验证命令。
+- [v1.5.0 发布说明](RELEASE-NOTES-1.5.0.md)：服务端新增可选 SOCKS5 上游中继模式（配置 `[upstream]` 后服务端全部 TCP/UDP 流量经上游转发，本机仅作中继，不本地解析目标域名且不回退直连）；Windows 桌面客户端（`proxy-gui`）修复托盘事件线程空转高占用 CPU 问题，并新增无窗口托盘简化模式（按需建窗、收起即销毁释放渲染资源）与右键启停代理客户端功能。
 - [v1.4.2 发布说明](RELEASE-NOTES-1.4.2.md)：Android 前台服务被系统重建后通过 JNI 自动恢复 Rust SOCKS5，并针对数据采集场景做深度功耗优化（按实际字节流量持锁、连接池深度空闲、常驻缓冲日志写入、Wi-Fi 锁功耗优化）。
 - [v1.4.1 发布说明](RELEASE-NOTES-1.4.1.md)：Android 按流量持有 WakeLock/Wi-Fi Lock，修复睡眠后复用失效隧道和心跳反复重连。
 - [v1.4.0 发布说明](RELEASE-NOTES-1.4.0.md)：Android 客户端、TLS CA 导入、TCP 池诊断、UDP ASSOCIATE、后台运行和日志上限。

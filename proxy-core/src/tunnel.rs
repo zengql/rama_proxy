@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use rama::net::address::{Host, HostWithPort};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::error::AppError;
@@ -41,16 +41,10 @@ const STATUS_RESOLVE_FAILED: u8 = 0x04;
 const STATUS_CLIENT_ID_REQUIRED: u8 = 0x05;
 const IDLE_TUNNEL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const IDLE_TUNNEL_HEALTHY_FOR: Duration = Duration::from_secs(120);
-/// In deep idle, keep 1 verified standby tunnel probed at a much lower frequency
-/// (10 minutes) so the proxy always has a ready connection without triggering
-/// Android's "Frequently refreshes in the background" battery warning.
-const IDLE_TUNNEL_HEALTHY_FOR_DEEP_IDLE: Duration = Duration::from_secs(10 * 60);
 const POOL_MAINTENANCE_INTERVAL_FAST: Duration = Duration::from_secs(1);
 const POOL_MAINTENANCE_INTERVAL_SLOW: Duration = Duration::from_secs(30);
-/// After this long with zero proxy traffic, enter deep idle: scale standby pool
-/// target down to 1 connected tunnel and probe every 10 minutes.
-const POOL_DEEP_IDLE_AFTER: Duration = Duration::from_secs(3 * 60);
-const POOL_MAINTENANCE_INTERVAL_DEEP_IDLE: Duration = Duration::from_secs(10 * 60);
+const POOL_IDLE_CLOSE_AFTER: Duration = Duration::from_secs(5 * 60);
+const HEARTBEAT_IDLE_GRACE: Duration = Duration::from_secs(5 * 60);
 const TUNNEL_TCP_KEEPALIVE_SECS: u64 = 300;
 const MAINTENANCE_SWEEP_BATCH: usize = 8;
 const MAX_STALE_TUNNELS_PER_ACQUIRE: usize = 2;
@@ -95,6 +89,24 @@ struct RefillState {
     last_refill_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum OnDemandPhase {
+    Dormant = 0,
+    Active = 1,
+    HeartbeatGrace = 2,
+}
+
+impl OnDemandPhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Active,
+            2 => Self::HeartbeatGrace,
+            _ => Self::Dormant,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TunnelPool {
     server_addr: SocketAddr,
@@ -113,6 +125,11 @@ pub struct TunnelPool {
     next_tunnel_id: Arc<AtomicU64>,
     refill_state: Arc<Mutex<RefillState>>,
     tls: Option<ClientTlsContext>,
+    pool_idle_timeout: Duration,
+    heartbeat_idle_grace: Duration,
+    on_demand_phase: Arc<AtomicU8>,
+    phase_lock: Arc<StdMutex<()>>,
+    heartbeat_enabled_tx: watch::Sender<bool>,
 }
 
 pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -146,6 +163,17 @@ impl TunnelPool {
             AppError::InvalidConfig("client.server_addr must be host:port".to_string())
         })?;
         let (idle_tx, idle_rx) = mpsc::channel(config.pool_size);
+        let (heartbeat_enabled_tx, _) = watch::channel(false);
+        let pool_idle_timeout = std::env::var("RAMA_PROXY_POOL_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|secs| Duration::from_secs(secs.max(1)))
+            .unwrap_or(POOL_IDLE_CLOSE_AFTER);
+        let heartbeat_idle_grace = std::env::var("RAMA_PROXY_HEARTBEAT_IDLE_GRACE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(HEARTBEAT_IDLE_GRACE);
         Ok(Self {
             server_addr,
             shared_secret: Arc::<str>::from(config.shared_secret.clone()),
@@ -163,7 +191,156 @@ impl TunnelPool {
             next_tunnel_id: Arc::new(AtomicU64::new(1)),
             refill_state: Arc::new(Mutex::new(RefillState::default())),
             tls,
+            pool_idle_timeout,
+            heartbeat_idle_grace,
+            on_demand_phase: Arc::new(AtomicU8::new(OnDemandPhase::Dormant as u8)),
+            phase_lock: Arc::new(StdMutex::new(())),
+            heartbeat_enabled_tx,
         })
+    }
+
+    pub fn is_dormant(&self) -> bool {
+        self.phase() == OnDemandPhase::Dormant
+    }
+
+    pub fn subscribe_heartbeat_enabled(&self) -> watch::Receiver<bool> {
+        self.heartbeat_enabled_tx.subscribe()
+    }
+
+    fn phase(&self) -> OnDemandPhase {
+        OnDemandPhase::from_u8(self.on_demand_phase.load(Ordering::Acquire))
+    }
+
+    fn set_heartbeat_enabled(&self, enabled: bool) {
+        self.heartbeat_enabled_tx.send_if_modified(|current| {
+            if *current != enabled {
+                *current = enabled;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn wake_on_request(&self) {
+        let _guard = self
+            .phase_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.last_traffic_unix_ms
+            .store(unix_now_millis(), Ordering::Relaxed);
+        let prev = OnDemandPhase::from_u8(
+            self.on_demand_phase
+                .swap(OnDemandPhase::Active as u8, Ordering::AcqRel),
+        );
+        self.set_heartbeat_enabled(true);
+        if prev != OnDemandPhase::Active {
+            info!(
+                previous_phase = ?prev,
+                "on-demand request received; waking tunnel pool and heartbeat"
+            );
+        }
+        // Always notify so any active idle/grace timer resets from this request.
+        self.state_notify.notify_waiters();
+    }
+
+    async fn drain_all_idle_tunnels(&self) -> usize {
+        let mut drained = 0usize;
+        {
+            let mut idle_rx = self.idle_rx.lock().await;
+            while let Ok(tunnel) = idle_rx.try_recv() {
+                drop(tunnel);
+                drained = drained.saturating_add(1);
+            }
+        }
+        {
+            let mut refill_state = self.refill_state.lock().await;
+            refill_state.next_allowed_at = None;
+            refill_state.cooldown_logged_for = None;
+        }
+        drained
+    }
+
+    async fn advance_on_demand_phase(&self) {
+        enum Transition {
+            None,
+            ToHeartbeatGrace,
+            ToDormant { drain_pool: bool },
+        }
+
+        let transition = {
+            let _guard = self
+                .phase_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.active.load(Ordering::Relaxed) > 0 {
+                let prev = OnDemandPhase::from_u8(
+                    self.on_demand_phase
+                        .swap(OnDemandPhase::Active as u8, Ordering::AcqRel),
+                );
+                if prev != OnDemandPhase::Active {
+                    self.set_heartbeat_enabled(true);
+                }
+                Transition::None
+            } else {
+                let last_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
+                if last_ms == 0 {
+                    Transition::None
+                } else {
+                    let elapsed = Duration::from_millis(unix_now_millis().saturating_sub(last_ms));
+                    let total_idle_timeout = self
+                        .pool_idle_timeout
+                        .saturating_add(self.heartbeat_idle_grace);
+                    match self.phase() {
+                        OnDemandPhase::Active if elapsed >= total_idle_timeout => {
+                            self.on_demand_phase
+                                .store(OnDemandPhase::Dormant as u8, Ordering::Release);
+                            self.set_heartbeat_enabled(false);
+                            Transition::ToDormant { drain_pool: true }
+                        }
+                        OnDemandPhase::Active if elapsed >= self.pool_idle_timeout => {
+                            self.on_demand_phase.store(
+                                OnDemandPhase::HeartbeatGrace as u8,
+                                Ordering::Release,
+                            );
+                            Transition::ToHeartbeatGrace
+                        }
+                        OnDemandPhase::HeartbeatGrace if elapsed >= total_idle_timeout => {
+                            self.on_demand_phase
+                                .store(OnDemandPhase::Dormant as u8, Ordering::Release);
+                            self.set_heartbeat_enabled(false);
+                            Transition::ToDormant { drain_pool: false }
+                        }
+                        _ => Transition::None,
+                    }
+                }
+            }
+        };
+
+        match transition {
+            Transition::None => {}
+            Transition::ToHeartbeatGrace => {
+                let closed = self.drain_all_idle_tunnels().await;
+                info!(
+                    closed_tunnels = closed,
+                    grace_secs = self.heartbeat_idle_grace.as_secs(),
+                    "idle pool timeout reached; closing reserved tunnels and keeping heartbeat for grace period"
+                );
+                self.state_notify.notify_waiters();
+            }
+            Transition::ToDormant { drain_pool } => {
+                let closed = if drain_pool {
+                    self.drain_all_idle_tunnels().await
+                } else {
+                    0
+                };
+                info!(
+                    closed_tunnels = closed,
+                    "heartbeat idle grace elapsed; entering dormant state"
+                );
+                self.state_notify.notify_waiters();
+            }
+        }
     }
 
     pub fn state_notify(&self) -> Arc<Notify> {
@@ -173,8 +350,11 @@ impl TunnelPool {
     /// Called when the host OS reports a network connectivity change (e.g. Android
     /// Wi-Fi <-> 5G switch or wakeup with restored network). Clears refill backoff,
     /// invalidates cached idle tunnel freshness so they are probed immediately, and
-    /// wakes the maintainer to ensure a connected tunnel is ready right away.
+    /// wakes the maintainer to ensure a connected tunnel is ready right away while active.
     pub async fn notify_network_available(&self) {
+        if self.phase() != OnDemandPhase::Active {
+            return;
+        }
         {
             let mut refill_state = self.refill_state.lock().await;
             refill_state.consecutive_failures = 0;
@@ -197,53 +377,64 @@ impl TunnelPool {
         self.state_notify.notify_waiters();
     }
 
-    fn is_deep_idle(&self) -> bool {
-        if self.active.load(Ordering::Relaxed) > 0 {
-            return false;
-        }
-        let last_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
-        if last_ms == 0 {
-            return false;
-        }
-        let elapsed_ms = unix_now_millis().saturating_sub(last_ms);
-        elapsed_ms >= POOL_DEEP_IDLE_AFTER.as_millis() as u64
-    }
-
-    /// In deep idle (no traffic for >= 3 minutes), keep 1 connected standby tunnel
-    /// instead of the full `warm_idle_target` so the app always has an immediate
-    /// network connection ready without firing keepalives across multiple idle sockets.
-    /// Scales back up to `warm_idle_target` immediately on the next request.
     fn effective_warm_target(&self) -> usize {
-        if self.is_deep_idle() {
-            self.warm_idle_target.min(1)
-        } else {
+        if self.phase() == OnDemandPhase::Active {
             self.warm_idle_target
+        } else {
+            0
         }
     }
 
     pub fn spawn_maintainer(&self) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            // Initialize the idle clock so deep idle activates 3 minutes after startup
-            // even if zero requests were sent right after starting the app.
-            this.last_traffic_unix_ms
-                .compare_exchange(0, unix_now_millis(), Ordering::Relaxed, Ordering::Relaxed)
-                .ok();
             loop {
-                this.reap_idle_tunnels().await;
-                this.schedule_refill().await;
-                let interval = this.pick_maintenance_interval().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
-                    _ = this.state_notify.notified(), if interval > POOL_MAINTENANCE_INTERVAL_SLOW => {}
+                // Register the waiter before inspecting phase/timestamps so a concurrent
+                // request wakeup can never be missed while transitioning or computing sleep.
+                let notified = this.state_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                this.advance_on_demand_phase().await;
+                if this.phase() == OnDemandPhase::Active {
+                    this.reap_idle_tunnels().await;
+                    this.schedule_refill().await;
+                }
+                match this.pick_maintenance_interval().await {
+                    Some(interval) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = &mut notified => {}
+                        }
+                    }
+                    None => {
+                        notified.await;
+                    }
                 }
             }
         })
     }
 
     /// Chooses the next maintenance sleep duration based on pool state so the
-    /// maintainer backs off when everything is healthy, saving CPU and battery.
-    async fn pick_maintenance_interval(&self) -> Duration {
+    /// maintainer backs off when everything is healthy and parks completely when dormant.
+    async fn pick_maintenance_interval(&self) -> Option<Duration> {
+        match self.phase() {
+            OnDemandPhase::Dormant => return None,
+            OnDemandPhase::HeartbeatGrace => {
+                let last_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
+                let elapsed = Duration::from_millis(unix_now_millis().saturating_sub(last_ms));
+                let total = self
+                    .pool_idle_timeout
+                    .saturating_add(self.heartbeat_idle_grace);
+                return Some(
+                    total
+                        .saturating_sub(elapsed)
+                        .max(Duration::from_millis(50)),
+                );
+            }
+            OnDemandPhase::Active => {}
+        }
+
         let idle = self.idle_len();
         let inspecting = self.inspecting_idle.load(Ordering::Relaxed);
         let connecting = self.connecting.load(Ordering::Relaxed);
@@ -251,30 +442,43 @@ impl TunnelPool {
         let target = self.effective_warm_target();
 
         // If refill is backing off, honor the backoff cooldown
-        {
+        let mut interval = {
             let refill_state = self.refill_state.lock().await;
-            if let Some(next_allowed_at) = refill_state.next_allowed_at {
-                let now = Instant::now();
-                if next_allowed_at > now {
-                    let remaining = next_allowed_at.duration_since(now);
-                    return remaining.clamp(
-                        POOL_MAINTENANCE_INTERVAL_FAST,
-                        POOL_MAINTENANCE_INTERVAL_SLOW,
-                    );
-                }
+            refill_state
+                .next_allowed_at
+                .and_then(|next_allowed_at| {
+                    let now = Instant::now();
+                    (next_allowed_at > now).then(|| {
+                        next_allowed_at
+                            .duration_since(now)
+                            .clamp(POOL_MAINTENANCE_INTERVAL_FAST, POOL_MAINTENANCE_INTERVAL_SLOW)
+                    })
+                })
+        };
+
+        if interval.is_none() {
+            // Pool is below the effective warm target or refills/probes are running — stay fast.
+            if idle.saturating_add(in_flight) < target || in_flight > 0 {
+                interval = Some(POOL_MAINTENANCE_INTERVAL_FAST);
+            } else {
+                interval = Some(POOL_MAINTENANCE_INTERVAL_SLOW);
             }
         }
 
-        // Pool is below the effective warm target or refills/probes are running — stay fast.
-        if idle.saturating_add(in_flight) < target || in_flight > 0 {
-            return POOL_MAINTENANCE_INTERVAL_FAST;
+        let mut interval = interval.expect("maintenance interval should be computed");
+        if self.active.load(Ordering::Relaxed) == 0 {
+            let last_ms = self.last_traffic_unix_ms.load(Ordering::Relaxed);
+            if last_ms > 0 {
+                let elapsed = Duration::from_millis(unix_now_millis().saturating_sub(last_ms));
+                let remaining = self
+                    .pool_idle_timeout
+                    .saturating_sub(elapsed)
+                    .max(Duration::from_millis(50));
+                interval = interval.min(remaining);
+            }
         }
 
-        if self.is_deep_idle() {
-            return POOL_MAINTENANCE_INTERVAL_DEEP_IDLE;
-        }
-
-        POOL_MAINTENANCE_INTERVAL_SLOW
+        Some(interval)
     }
 
     fn idle_len(&self) -> usize {
@@ -388,6 +592,7 @@ impl TunnelPool {
         let state_notify = self.state_notify.clone();
         let refill_state = self.refill_state.clone();
         let tls = self.tls.clone();
+        let on_demand_phase = self.on_demand_phase.clone();
         let tls_backend = tls.as_ref().map(|tls| tls.backend).unwrap_or("plain");
         let tls_server_name = tls
             .as_ref()
@@ -421,7 +626,16 @@ impl TunnelPool {
             match result {
                 Ok(stream) => {
                     reset_refill_backoff(&refill_state).await;
-                    if sender
+                    if OnDemandPhase::from_u8(on_demand_phase.load(Ordering::Acquire))
+                        != OnDemandPhase::Active
+                    {
+                        connecting.fetch_sub(1, Ordering::SeqCst);
+                        drop(stream);
+                        debug!(
+                            tunnel_id,
+                            "discarding late warm-refill tunnel after leaving active phase"
+                        );
+                    } else if sender
                         .send(IdleTunnel::new(tunnel_id, stream))
                         .await
                         .is_err()
@@ -468,6 +682,7 @@ impl TunnelPool {
     }
 
     pub async fn acquire(&self) -> Result<TunnelLease, AppError> {
+        self.wake_on_request();
         let mut stale_count = 0usize;
         loop {
             let next_idle = {
@@ -606,33 +821,12 @@ impl TunnelPool {
         self.inspecting_idle
             .fetch_add(drained.len(), Ordering::SeqCst);
 
-        let deep_idle = self.is_deep_idle();
-        let target = self.effective_warm_target();
-        let healthy_for = if deep_idle {
-            IDLE_TUNNEL_HEALTHY_FOR_DEEP_IDLE
-        } else {
-            IDLE_TUNNEL_HEALTHY_FOR
-        };
-        let mut kept_in_deep_idle = 0usize;
-
         for mut idle_tunnel in drained {
-            // In deep idle, shed excess idle tunnels down to `target` (1) so only a single
-            // standby TCP connection stays open in the background, minimizing radio wakeups.
-            if deep_idle && kept_in_deep_idle >= target {
-                self.inspecting_idle.fetch_sub(1, Ordering::SeqCst);
-                debug!(
-                    tunnel_id = idle_tunnel.tunnel_id,
-                    target, "releasing excess idle tunnel in deep-idle standby mode"
-                );
-                continue;
-            }
-
             if idle_tunnel
                 .verified_at
                 .elapsed()
-                .is_ok_and(|age| age < healthy_for)
+                .is_ok_and(|age| age < IDLE_TUNNEL_HEALTHY_FOR)
             {
-                kept_in_deep_idle = kept_in_deep_idle.saturating_add(1);
                 self.return_idle_tunnel(idle_tunnel).await;
                 continue;
             }
@@ -644,7 +838,6 @@ impl TunnelPool {
                         tunnel_id = idle_tunnel.tunnel_id,
                         "idle tunnel probe succeeded"
                     );
-                    kept_in_deep_idle = kept_in_deep_idle.saturating_add(1);
                     self.return_idle_tunnel(idle_tunnel).await;
                 }
                 Err(err) => {

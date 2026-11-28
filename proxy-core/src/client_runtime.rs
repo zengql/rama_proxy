@@ -105,14 +105,17 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
     };
 
     let maintainer = pool.spawn_maintainer();
+    let mut heartbeat_enabled = pool.subscribe_heartbeat_enabled();
     let network_listener = network_events.clone().map(|events| {
         let pool = pool.clone();
         tokio::spawn(async move {
             loop {
                 events.notified().await;
-                info!(
-                    "host network connectivity change notified; probing and refilling tunnel pool"
-                );
+                if !pool.is_dormant() {
+                    info!(
+                        "host network connectivity change notified; probing and refilling tunnel pool"
+                    );
+                }
                 pool.notify_network_available().await;
             }
         })
@@ -123,6 +126,10 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
         let notify = pool.state_notify();
         tokio::spawn(async move {
             loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
                 let snapshot = pool.snapshot().await;
                 let is_active = snapshot.active > 0;
                 let has_recent_traffic = snapshot.last_traffic_age_secs.is_some_and(|age| age < 12);
@@ -138,17 +145,24 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
                 // Event-driven wakeup on tunnel state changes, with a low-power fallback timer:
                 // - 2s while traffic is actively flowing or cooling down (10s lock window)
                 // - 5s during refill backoff so countdown UI updates
-                // - 60s when completely idle so the CPU/Tokio runtime stays asleep
+                // - None (purely event-driven) once idle so the runtime stays dormant
                 let interval = if is_active || has_recent_traffic {
-                    Duration::from_secs(2)
+                    Some(Duration::from_secs(2))
                 } else if has_backoff {
-                    Duration::from_secs(5)
+                    Some(Duration::from_secs(5))
                 } else {
-                    Duration::from_secs(60)
+                    None
                 };
-                tokio::select! {
-                    _ = notify.notified() => {}
-                    _ = tokio::time::sleep(interval) => {}
+                match interval {
+                    Some(interval) => {
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = tokio::time::sleep(interval) => {}
+                        }
+                    }
+                    None => {
+                        notified.await;
+                    }
                 }
             }
         })
@@ -167,57 +181,87 @@ pub async fn run_with_shutdown_ready_pool_stats_and_network_events(
                 return;
             }
         };
-        let mut consecutive_failures = 0u32;
         loop {
-            let started = Instant::now();
-            let result = match build_client_tls_context(&heartbeat_config.tls) {
-                Ok(tls) => {
-                    run_heartbeat(
-                        server_addr,
-                        &heartbeat_config.client.shared_secret,
-                        &resolve_client_id(&heartbeat_config.client.client_id),
-                        Duration::from_secs(heartbeat_config.client.connect_timeout_secs.max(1)),
-                        tls,
-                        NEXT_HEARTBEAT_ID.fetch_add(1, Ordering::Relaxed),
-                        // The server pushes one heartbeat per interval, so waiting only
-                        // `heartbeat_timeout_secs` between pushes would drop and redial the
-                        // channel every cycle. Allow a full interval plus the timeout.
-                        Duration::from_secs(
-                            heartbeat_config.client.heartbeat_interval_secs.max(1)
-                                + heartbeat_config.client.heartbeat_timeout_secs.max(1),
-                        ),
-                    )
-                    .await
+            while !*heartbeat_enabled.borrow_and_update() {
+                if heartbeat_enabled.changed().await.is_err() {
+                    return;
                 }
-                Err(err) => Err(err),
-            };
-            if started.elapsed() >= Duration::from_secs(30) {
-                consecutive_failures = 0;
             }
-            match result {
-                Ok(()) => {
-                    consecutive_failures = 0;
-                }
-                Err(err) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let shift = consecutive_failures.saturating_sub(1).min(5);
-                    let retry_secs = (10u64 << shift).min(300);
-                    warn!(
-                        error = %err,
-                        consecutive_failures,
-                        retry_secs,
-                        "heartbeat channel unavailable; backing off before retry"
-                    );
-                    if let Some(events) = heartbeat_network_events.as_ref() {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(retry_secs)) => {}
-                            _ = events.notified() => {
-                                consecutive_failures = 0;
+            let tls_config = heartbeat_config.tls.clone();
+            let client_config = heartbeat_config.client.clone();
+            let network_events = heartbeat_network_events.clone();
+            let run_loop = async {
+                let mut consecutive_failures = 0u32;
+                loop {
+                    let started = Instant::now();
+                    let result = match build_client_tls_context(&tls_config) {
+                        Ok(tls) => {
+                            run_heartbeat(
+                                server_addr,
+                                &client_config.shared_secret,
+                                &resolve_client_id(&client_config.client_id),
+                                Duration::from_secs(client_config.connect_timeout_secs.max(1)),
+                                tls,
+                                NEXT_HEARTBEAT_ID.fetch_add(1, Ordering::Relaxed),
+                                // The server pushes one heartbeat per interval, so waiting only
+                                // `heartbeat_timeout_secs` between pushes would drop and redial the
+                                // channel every cycle. Allow a full interval plus the timeout.
+                                Duration::from_secs(
+                                    client_config.heartbeat_interval_secs.max(1)
+                                        + client_config.heartbeat_timeout_secs.max(1),
+                                ),
+                            )
+                            .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        consecutive_failures = 0;
+                    }
+                    match result {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                        }
+                        Err(err) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            let shift = consecutive_failures.saturating_sub(1).min(5);
+                            let retry_secs = (10u64 << shift).min(300);
+                            warn!(
+                                error = %err,
+                                consecutive_failures,
+                                retry_secs,
+                                "heartbeat channel unavailable; backing off before retry"
+                            );
+                            if let Some(events) = network_events.as_ref() {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_secs(retry_secs)) => {}
+                                    _ = events.notified() => {
+                                        consecutive_failures = 0;
+                                    }
+                                }
+                            } else {
+                                tokio::time::sleep(Duration::from_secs(retry_secs)).await;
                             }
                         }
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(retry_secs)).await;
                     }
+                }
+            };
+            tokio::select! {
+                _ = run_loop => {}
+                changed = async {
+                    loop {
+                        if heartbeat_enabled.changed().await.is_err() {
+                            return false;
+                        }
+                        if !*heartbeat_enabled.borrow_and_update() {
+                            return true;
+                        }
+                    }
+                } => {
+                    if !changed {
+                        return;
+                    }
+                    debug!("heartbeat channel suspended during dormancy");
                 }
             }
         }
@@ -615,7 +659,7 @@ async fn serve_udp_associate(
     }
 }
 
-fn parse_socks5_udp_datagram(packet: &[u8]) -> Result<(HostWithPort, &[u8]), AppError> {
+pub(crate) fn parse_socks5_udp_datagram(packet: &[u8]) -> Result<(HostWithPort, &[u8]), AppError> {
     let mut cursor = Cursor::new(packet);
     let header = UdpHeader::read_from_sync(&mut cursor)
         .map_err(|err| AppError::Boxed(format!("parse socks5 udp header failed: {err}")))?;
@@ -628,7 +672,7 @@ fn parse_socks5_udp_datagram(packet: &[u8]) -> Result<(HostWithPort, &[u8]), App
     Ok((header.destination, &packet[offset..]))
 }
 
-fn build_socks5_udp_datagram(source: &HostWithPort, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_socks5_udp_datagram(source: &HostWithPort, payload: &[u8]) -> Vec<u8> {
     let header = UdpHeader {
         fragment_number: 0,
         destination: source.clone(),

@@ -9,16 +9,18 @@ use rama::{
         address::{Domain, HostWithPort},
         mode::{ConnectIpMode, DnsResolveIpMode},
     },
+    proxy::socks5::proto::Command,
     tcp::client::tcp_connect,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, lookup_host},
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    client_runtime::{build_socks5_udp_datagram, parse_socks5_udp_datagram},
     config::ServerConfigFile,
     error::AppError,
     server_stats::{ServerStatsRegistry, spawn_stats_server},
@@ -35,8 +37,10 @@ use crate::{
 use std::time::{Duration, Instant};
 
 mod relay;
+mod upstream;
 
 const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 10;
 const TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const SLOW_TARGET_DIAL_MS: u64 = 500;
 const UDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -54,6 +58,7 @@ pub async fn run(config: ServerConfigFile, stats_socket: PathBuf) -> Result<(), 
     info!(
         bind = %listen_addr,
         outbound_ip_mode = %config.server.outbound_ip_mode,
+        upstream_socks5 = ?config.upstream.as_ref().map(|proxy| &proxy.address),
         tls_enabled = config.tls.enabled,
         handshake_timeout_secs = config.server.handshake_timeout_secs,
         max_handshakes = config.server.max_handshakes,
@@ -414,10 +419,27 @@ where
     let extensions = build_outbound_extensions(&config.server.outbound_ip_mode)?;
     let dns = TimedDnsResolver::default();
     let started = Instant::now();
-    let connect_result = tokio::time::timeout(
-        OUTBOUND_CONNECT_TIMEOUT,
-        tcp_connect(&extensions, target.clone(), dns.clone(), ()),
-    )
+    let dial_target = config
+        .upstream
+        .as_ref()
+        .map_or(&target, |proxy| &proxy.address);
+    let connect_timeout = outbound_connect_timeout(config);
+    let connect_result = tokio::time::timeout(connect_timeout, async {
+        let (conn, addr) = tcp_connect(&extensions, dial_target.clone(), dns.clone(), ())
+            .await
+            .map_err(|err| AppError::Boxed(err.to_string()))?;
+        let mut stream = conn.stream;
+        configure_tcp_stream(
+            &stream,
+            config.server.tcp_keepalive_secs,
+            connection_id,
+            addr,
+        );
+        if let Some(proxy) = &config.upstream {
+            upstream::request(&mut stream, proxy, Command::Connect, &target).await?;
+        }
+        Ok::<_, AppError>((stream, addr))
+    })
     .await;
     let ended = Instant::now();
     let dial_ms = (ended - started).as_millis() as u64;
@@ -430,7 +452,7 @@ where
     let dns_ipv4_ms = dns_ms(&dns.0.ipv4);
     let dns_ipv6_ms = dns_ms(&dns.0.ipv6);
     match connect_result {
-        Ok(Ok((upstream, addr))) => {
+        Ok(Ok((mut upstream, addr))) => {
             let dns_ms = if addr.is_ipv4() {
                 dns_ipv4_ms
             } else {
@@ -444,13 +466,6 @@ where
             } else {
                 debug!(target: "proxy_core::server_runtime::dial", connection_id, target = %target, upstream = %addr, dns_ms, tcp_phase_ms, dial_ms, "Target connected");
             }
-            let mut upstream = upstream.stream;
-            configure_tcp_stream(
-                &upstream,
-                config.server.tcp_keepalive_secs,
-                connection_id,
-                addr,
-            );
             stats.set_upstream_addr(connection_id, addr).await;
             // Older clients consume and ignore the successful response message.
             let message = format!("ok id={connection_id} dial_ms={dial_ms}");
@@ -479,7 +494,7 @@ where
         Err(_) => {
             let message = format!(
                 "connect target {target} timed out after {}s",
-                OUTBOUND_CONNECT_TIMEOUT.as_secs()
+                connect_timeout.as_secs()
             );
             warn!(connection_id, target = %target, dial_ms, dns_ipv4_ms, dns_ipv6_ms, "Target connection timed out");
             let (status, response_message) = status_connect_failed(&message);
@@ -500,8 +515,47 @@ async fn serve_udp_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let bind_ip = parse_bind_ip(&config.server.bind)?;
-    let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
+    let (udp, mut upstream_control) = if let Some(proxy) = &config.upstream {
+        let connect_timeout = outbound_connect_timeout(config);
+        let association = tokio::time::timeout(
+            connect_timeout,
+            upstream::associate_udp(
+                proxy,
+                &config.server.outbound_ip_mode,
+                config.server.tcp_keepalive_secs,
+                connection_id,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppError::Boxed(format!(
+                "upstream SOCKS5 UDP association timed out after {}s",
+                connect_timeout.as_secs()
+            )))
+        });
+        match association {
+            Ok((udp, control)) => (udp, Some(control)),
+            Err(err) => {
+                warn!(
+                    connection_id,
+                    client = %peer,
+                    upstream = %proxy.address,
+                    error = %err,
+                    "upstream SOCKS5 UDP association failed"
+                );
+                let (status, message) = status_connect_failed(&err.to_string());
+                write_response(tunnel, status, &message).await?;
+                return Err(err);
+            }
+        }
+    } else {
+        let bind_ip = parse_bind_ip(&config.server.bind)?;
+        (UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?, None)
+    };
+    let upstream_relay = upstream_control
+        .as_ref()
+        .map(|_| udp.peer_addr())
+        .transpose()?;
     write_response(tunnel, 0, "ok").await?;
 
     let mut recv_buf = vec![0u8; 65535];
@@ -539,11 +593,30 @@ where
                             return Ok(());
                         }
                     };
-                    let remote = resolve_udp_target(&target, &config.server.outbound_ip_mode).await?;
+                    let remote = if let Some(relay) = upstream_relay {
+                        let datagram = build_socks5_udp_datagram(&target, &payload);
+                        if let Err(err) = udp.send(&datagram).await {
+                            if is_ignorable_udp_io_error(&err) {
+                                warn!(
+                                    connection_id,
+                                    client = %peer,
+                                    target = %target,
+                                    error = %err,
+                                    "dropping udp packet due to transient upstream send error"
+                                );
+                                continue;
+                            }
+                            return Err(err.into());
+                        }
+                        relay
+                    } else {
+                        let remote = resolve_udp_target(&target, &config.server.outbound_ip_mode).await?;
+                        udp.send_to(&payload, remote).await?;
+                        remote
+                    };
                     stats
                         .add_udp_client_bytes(connection_id, target, remote, payload.len() as u64)
                         .await;
-                    udp.send_to(&payload, remote).await?;
                     last_activity = std::time::Instant::now();
                 } else if opcode_is_ping(opcode) {
                     stats.touch(connection_id).await;
@@ -563,13 +636,69 @@ where
                 }
             }
             recv = udp.recv_from(&mut recv_buf) => {
-                let (n, remote) = recv?;
-                let source = HostWithPort::from(remote);
+                let (n, remote) = match recv {
+                    Ok(result) => result,
+                    Err(err) if is_transient_udp_recv_error(&err) => {
+                        debug!(
+                            connection_id,
+                            client = %peer,
+                            error = %err,
+                            "ignoring transient udp recv error"
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let (source, payload) = if upstream_relay.is_some() {
+                    match parse_socks5_udp_datagram(&recv_buf[..n]) {
+                        Ok(packet) => packet,
+                        Err(err) => {
+                            debug!(connection_id, error = %err, "invalid upstream SOCKS5 UDP datagram");
+                            continue;
+                        }
+                    }
+                } else {
+                    (HostWithPort::from(remote), &recv_buf[..n])
+                };
                 stats
-                    .add_udp_target_bytes(connection_id, remote, n as u64)
+                    .add_udp_target_bytes(connection_id, remote, payload.len() as u64)
                     .await;
-                write_udp_packet(tunnel, &source, &recv_buf[..n]).await?;
+                write_udp_packet(tunnel, &source, payload).await?;
                 last_activity = std::time::Instant::now();
+            }
+            result = async {
+                match upstream_control.as_mut() {
+                    Some(control) => control.read(&mut [0]).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok(0) => {
+                        debug!(
+                            connection_id,
+                            client = %peer,
+                            "upstream SOCKS5 UDP control connection closed"
+                        );
+                    }
+                    Ok(bytes) => {
+                        warn!(
+                            connection_id,
+                            client = %peer,
+                            bytes,
+                            "unexpected data on upstream SOCKS5 UDP control connection; closing udp tunnel"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            connection_id,
+                            client = %peer,
+                            error = %err,
+                            "upstream SOCKS5 UDP control connection failed"
+                        );
+                    }
+                }
+                let _ = write_close(tunnel).await;
+                return Ok(());
             }
             _ = tokio::time::sleep(UDP_SELECT_INTERVAL) => {
                 if last_activity.elapsed() >= idle_timeout {
@@ -662,6 +791,30 @@ async fn resolve_udp_target(target: &HostWithPort, mode: &str) -> Result<SocketA
 fn parse_bind_ip(bind: &str) -> Result<IpAddr, AppError> {
     bind.parse()
         .map_err(|_| AppError::InvalidConfig("bind must be a valid IP address".to_string()))
+}
+
+fn outbound_connect_timeout(config: &ServerConfigFile) -> Duration {
+    match &config.upstream {
+        Some(proxy) => Duration::from_secs(
+            proxy
+                .connect_timeout_secs
+                .unwrap_or(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS)
+                .max(1),
+        ),
+        None => OUTBOUND_CONNECT_TIMEOUT,
+    }
+}
+
+fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    ) || matches!(err.raw_os_error(), Some(10054))
+}
+
+fn is_ignorable_udp_io_error(err: &std::io::Error) -> bool {
+    is_transient_udp_recv_error(err)
+        || matches!(err.raw_os_error(), Some(90) | Some(40) | Some(10040))
 }
 
 #[cfg(test)]

@@ -2,6 +2,14 @@
 
 `rama-proxy` is a client/server SOCKS5 proxy for Clash-style rule engines.
 
+## Release 1.5.0
+
+Feature release adding optional SOCKS5 upstream relay mode on `rama-proxy server`:
+
+- Added `[upstream]` configuration in `server.toml` (`address`, optional `username` / `password`, optional `connect_timeout_secs` defaulting to `10`), with strict unknown-field rejection (`deny_unknown_fields`), `server init` template comments, and upstream summary output in `server check`.
+- When `[upstream]` is configured, all server TCP (`CONNECT`) and UDP (`UDP ASSOCIATE`) traffic is relayed exclusively through the upstream SOCKS5 proxy. Original target hostnames are forwarded directly to the upstream without local target DNS resolution or direct fallback on upstream failure/rejection.
+- Enabled `TCP_NODELAY` and TCP keepalive before upstream SOCKS5 handshakes (including the `UDP ASSOCIATE` control socket), logged upstream UDP control-stream closures/errors, and kept UDP relay sessions alive across transient per-datagram send/recv errors.
+
 ## Release 1.4.2
 
 Patch release focused on Android foreground-service recovery and power consumption optimizations for mobile data collection:

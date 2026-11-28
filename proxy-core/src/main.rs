@@ -59,11 +59,15 @@ async fn handle_server(cmd: ServerCommand) -> Result<(), AppError> {
             let config = ServerConfigFile::from_path(&path)?;
             config.validate()?;
             println!(
-                "server config valid: bind={}:{}, outbound_ip_mode={}, tls={}",
+                "server config valid: bind={}:{}, outbound_ip_mode={}, tls={}, upstream={}",
                 config.server.bind,
                 config.server.port,
                 config.server.outbound_ip_mode,
-                config.tls.enabled
+                config.tls.enabled,
+                config
+                    .upstream
+                    .as_ref()
+                    .map_or_else(|| "direct".to_string(), |proxy| proxy.address.to_string())
             );
             Ok(())
         }

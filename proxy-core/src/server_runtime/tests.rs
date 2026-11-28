@@ -1,5 +1,9 @@
 use super::*;
-use crate::tunnel::{client_handshake, read_response, write_open_connect};
+use crate::{
+    config::UpstreamSocks5Config,
+    tunnel::{client_handshake, read_response, write_open_connect, write_open_udp},
+};
+use rama::proxy::socks5::proto::{ReplyKind, SocksMethod, client, server};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task::JoinHandle,
@@ -105,6 +109,323 @@ async fn closing_one_active_tcp_tunnel_leaves_other_tunnels_running() {
     })
     .await
     .unwrap();
+}
+
+async fn upstream_listener() -> (ServerConfigFile, TcpListener) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let config = ServerConfigFile {
+        upstream: Some(UpstreamSocks5Config {
+            address: listener.local_addr().unwrap().into(),
+            username: None,
+            password: None,
+            connect_timeout_secs: None,
+        }),
+        ..ServerConfigFile::default()
+    };
+    (config, listener)
+}
+
+#[tokio::test]
+async fn tcp_tunnel_connects_to_authenticated_upstream_with_original_hostname() {
+    timeout(TEST_TIMEOUT, async {
+        let stats = ServerStatsRegistry::new();
+        let (mut config, upstream) = upstream_listener().await;
+        let proxy = config.upstream.as_mut().unwrap();
+        proxy.username = Some("proxy-user".to_string());
+        proxy.password = Some("proxy-password".to_string());
+        let target: HostWithPort = "only-at-upstream.invalid:443".parse().unwrap();
+        let expected_target = target.clone();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let header = client::Header::read_from(&mut stream).await.unwrap();
+            assert_eq!(header.methods.as_slice(), &[SocksMethod::UsernamePassword]);
+            server::Header::new(SocksMethod::UsernamePassword)
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+            let auth = client::UsernamePasswordRequest::read_from(&mut stream)
+                .await
+                .unwrap();
+            assert_eq!(auth.basic.username(), "proxy-user");
+            assert_eq!(auth.basic.password(), Some("proxy-password"));
+            server::UsernamePasswordResponse::new_success()
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+            let request = client::Request::read_from(&mut stream).await.unwrap();
+            assert_eq!(request.command, Command::Connect);
+            assert_eq!(request.destination, expected_target);
+            server::Reply::new(HostWithPort::from((Ipv4Addr::UNSPECIFIED, 0)))
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+            let mut payload = [0; 4];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let (mut tunnel, server) = start_tunnel(config.clone(), &stats, None).await;
+        client_handshake(&mut tunnel, &config.auth.shared_secret, "test-client")
+            .await
+            .unwrap();
+        write_open_connect(&mut tunnel, &target).await.unwrap();
+        read_response(&mut tunnel).await.unwrap();
+        tunnel.write_all(b"ping").await.unwrap();
+        let mut payload = [0; 4];
+        tunnel.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"pong");
+        tunnel.shutdown().await.unwrap();
+        mock.await.unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn upstream_rejections_do_not_fall_back_to_direct_tcp_or_udp() {
+    timeout(TEST_TIMEOUT, async {
+        let stats = ServerStatsRegistry::new();
+        let (config, upstream) = upstream_listener().await;
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = HostWithPort::from(origin.local_addr().unwrap());
+        let mock = tokio::spawn(async move {
+            for command in [Command::Connect, Command::UdpAssociate] {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let header = client::Header::read_from(&mut stream).await.unwrap();
+                assert_eq!(
+                    header.methods.as_slice(),
+                    &[SocksMethod::NoAuthenticationRequired]
+                );
+                server::Header::new(SocksMethod::NoAuthenticationRequired)
+                    .write_to(&mut stream)
+                    .await
+                    .unwrap();
+                let request = client::Request::read_from(&mut stream).await.unwrap();
+                assert_eq!(request.command, command);
+                server::Reply::error_reply(ReplyKind::CommandNotSupported)
+                    .write_to(&mut stream)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for command in [Command::Connect, Command::UdpAssociate] {
+            let (mut tunnel, server) = start_tunnel(config.clone(), &stats, None).await;
+            client_handshake(&mut tunnel, &config.auth.shared_secret, "test-client")
+                .await
+                .unwrap();
+            if command == Command::Connect {
+                write_open_connect(&mut tunnel, &target).await.unwrap();
+            } else {
+                write_open_udp(&mut tunnel).await.unwrap();
+            }
+            let err = read_response(&mut tunnel).await.unwrap_err();
+            assert!(err.to_string().contains("CommandNotSupported"), "{err}");
+            assert!(server.await.unwrap().is_err());
+        }
+        mock.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn udp_tunnel_relays_datagrams_and_closes_with_upstream_control() {
+    timeout(TEST_TIMEOUT, async {
+        let stats = ServerStatsRegistry::new();
+        let (config, upstream) = upstream_listener().await;
+        let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target: HostWithPort = "only-at-upstream.invalid:53".parse().unwrap();
+        let expected_target = target.clone();
+        let answer: HostWithPort = "192.0.2.8:53".parse().unwrap();
+        let source = answer.clone();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let mock = tokio::spawn(async move {
+            let (mut control, _) = upstream.accept().await.unwrap();
+            client::Header::read_from(&mut control).await.unwrap();
+            server::Header::new(SocksMethod::NoAuthenticationRequired)
+                .write_to(&mut control)
+                .await
+                .unwrap();
+            let request = client::Request::read_from(&mut control).await.unwrap();
+            assert_eq!(request.command, Command::UdpAssociate);
+            assert_eq!(
+                request.destination,
+                HostWithPort::from((Ipv4Addr::UNSPECIFIED, 0))
+            );
+            let bind =
+                HostWithPort::from((Ipv4Addr::UNSPECIFIED, relay.local_addr().unwrap().port()));
+            server::Reply::new(bind)
+                .write_to(&mut control)
+                .await
+                .unwrap();
+
+            let mut buf = [0; 512];
+            let (n, from) = relay.recv_from(&mut buf).await.unwrap();
+            let (destination, payload) = parse_socks5_udp_datagram(&buf[..n]).unwrap();
+            assert_eq!(destination, expected_target);
+            assert_eq!(payload, b"dns request");
+            relay
+                .send_to(&build_socks5_udp_datagram(&source, b"dns response"), from)
+                .await
+                .unwrap();
+            close_rx.await.unwrap();
+        });
+
+        let (mut tunnel, server) = start_tunnel(config.clone(), &stats, None).await;
+        client_handshake(&mut tunnel, &config.auth.shared_secret, "test-client")
+            .await
+            .unwrap();
+        write_open_udp(&mut tunnel).await.unwrap();
+        read_response(&mut tunnel).await.unwrap();
+        write_udp_packet(&mut tunnel, &target, b"dns request")
+            .await
+            .unwrap();
+        assert!(opcode_is_udp_packet(
+            read_opcode(&mut tunnel).await.unwrap()
+        ));
+        let (source, payload) = read_udp_packet(&mut tunnel).await.unwrap();
+        assert_eq!(source, answer);
+        assert_eq!(payload, b"dns response");
+        close_tx.send(()).unwrap();
+        assert!(opcode_is_close(read_opcode(&mut tunnel).await.unwrap()));
+        mock.await.unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn upstream_auth_failure_and_unreachable_do_not_fall_back_to_direct() {
+    timeout(TEST_TIMEOUT, async {
+        let stats = ServerStatsRegistry::new();
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = HostWithPort::from(origin.local_addr().unwrap());
+
+        // Case 1 & 2: NoAcceptableMethods and UsernamePassword auth rejection
+        let (mut config, upstream) = upstream_listener().await;
+        let proxy = config.upstream.as_mut().unwrap();
+        proxy.username = Some("proxy-user".to_string());
+        proxy.password = Some("wrong-password".to_string());
+        let mock = tokio::spawn(async move {
+            // Case 1: reject auth method
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let header = client::Header::read_from(&mut stream).await.unwrap();
+            assert_eq!(header.methods.as_slice(), &[SocksMethod::UsernamePassword]);
+            server::Header::new(SocksMethod::NoAcceptableMethods)
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+
+            // Case 2: accept method, reject credentials (RFC 1929 status = 0x01)
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            client::Header::read_from(&mut stream).await.unwrap();
+            server::Header::new(SocksMethod::UsernamePassword)
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+            client::UsernamePasswordRequest::read_from(&mut stream)
+                .await
+                .unwrap();
+            stream.write_all(&[0x01, 0x01]).await.unwrap();
+        });
+
+        let (mut tunnel, server) = start_tunnel(config.clone(), &stats, None).await;
+        client_handshake(&mut tunnel, &config.auth.shared_secret, "test-client")
+            .await
+            .unwrap();
+        write_open_connect(&mut tunnel, &target).await.unwrap();
+        let err = read_response(&mut tunnel).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected authentication method"),
+            "{err}"
+        );
+        assert!(server.await.unwrap().is_err());
+
+        let (mut tunnel, server) = start_tunnel(config.clone(), &stats, None).await;
+        client_handshake(&mut tunnel, &config.auth.shared_secret, "test-client")
+            .await
+            .unwrap();
+        write_open_connect(&mut tunnel, &target).await.unwrap();
+        let err = read_response(&mut tunnel).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rejected username/password authentication"),
+            "{err}"
+        );
+        assert!(server.await.unwrap().is_err());
+        mock.await.unwrap();
+
+        // Case 3: upstream port is closed / unreachable
+        let (closed_config, closed_listener) = upstream_listener().await;
+        drop(closed_listener);
+        let (mut tunnel, server) = start_tunnel(closed_config.clone(), &stats, None).await;
+        client_handshake(
+            &mut tunnel,
+            &closed_config.auth.shared_secret,
+            "test-client",
+        )
+        .await
+        .unwrap();
+        write_open_connect(&mut tunnel, &target).await.unwrap();
+        assert!(read_response(&mut tunnel).await.is_err());
+        assert!(server.await.unwrap().is_err());
+
+        // Ensure local origin never received any direct fallback connection.
+        assert!(
+            timeout(Duration::from_millis(50), origin.accept())
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn upstream_toml_is_optional_and_validates_credentials_and_port() {
+    let direct = toml::from_str::<ServerConfigFile>("").unwrap();
+    assert!(direct.upstream.is_none());
+    direct.validate().unwrap();
+    let upstream = toml::from_str::<ServerConfigFile>(
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nconnect_timeout_secs = 15",
+    )
+    .unwrap();
+    upstream.validate().unwrap();
+
+    let too_long = "a".repeat(256);
+    let long_user_toml = format!(
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nusername = \"{too_long}\"\npassword = \"pass\""
+    );
+    let long_pass_toml = format!(
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nusername = \"user\"\npassword = \"{too_long}\""
+    );
+
+    for invalid in [
+        "[upstream]\naddress = \"proxy.example.com:0\"",
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nconnect_timeout_secs = 0",
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nusername = \"only-user\"",
+        "[upstream]\naddress = \"proxy.example.com:1080\"\nusername = \"user\"\npassword = \"\"",
+        long_user_toml.as_str(),
+        long_pass_toml.as_str(),
+    ] {
+        assert!(
+            toml::from_str::<ServerConfigFile>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    assert!(
+        toml::from_str::<ServerConfigFile>(
+            "[upstream]\naddress = \"proxy.example.com:1080\"\nunknown_field = true"
+        )
+        .is_err()
+    );
 }
 
 #[derive(Debug)]
