@@ -484,7 +484,7 @@ impl TunnelPool {
         Some(interval)
     }
 
-    fn idle_len(&self) -> usize {
+    pub fn idle_len(&self) -> usize {
         self.max_idle_size.saturating_sub(self.idle_tx.capacity())
     }
 
@@ -684,6 +684,13 @@ impl TunnelPool {
         self.state_notify.notify_waiters();
     }
 
+    /// Upper bound for a single [`TunnelPool::acquire`] call: one cold dial plus
+    /// the probes that may be spent discarding stale idle tunnels on the way.
+    pub fn acquire_budget(&self) -> Duration {
+        self.connect_timeout
+            + IDLE_TUNNEL_PROBE_TIMEOUT * (MAX_STALE_TUNNELS_PER_ACQUIRE as u32 + 1)
+    }
+
     pub async fn acquire(&self) -> Result<TunnelLease, AppError> {
         self.wake_on_request();
         let mut stale_count = 0usize;
@@ -746,6 +753,15 @@ impl TunnelPool {
             });
         }
 
+        self.acquire_fresh().await
+    }
+
+    /// Dials a brand new tunnel, bypassing the idle pool entirely.
+    ///
+    /// Callers use this as the retry step after a pooled tunnel failed to answer
+    /// a CONNECT: on a lossy path a "warm" tunnel can be silently dead while
+    /// still looking fresh to the pool, and only a fresh dial recovers.
+    pub async fn acquire_fresh(&self) -> Result<TunnelLease, AppError> {
         self.schedule_refill().await;
         let tunnel_id = self.allocate_tunnel_id();
         info!(
@@ -913,6 +929,13 @@ async fn probe_idle_tunnel(stream: &mut TunnelStream) -> Result<(), AppError> {
 impl TunnelLease {
     pub(crate) fn log_context(&self) -> (u64, &'static str) {
         (self.id, if self.from_pool { "warm" } else { "cold" })
+    }
+
+    /// Whether this lease came from the pre-warmed idle pool instead of being
+    /// dialed on demand. Callers use it to decide whether a failed CONNECT is
+    /// worth retrying on a brand new tunnel.
+    pub fn from_pool(&self) -> bool {
+        self.from_pool
     }
 
     fn touch_traffic(&self) {
